@@ -353,12 +353,11 @@ fn median_hv(cx: &mut Cx<'_>, p: &Buf, w: usize, h: usize, r: usize) -> Buf {
     }
     let pr = [w as u32, h as u32, 1, r.min(local::BASE_DETAIL_MAX) as u32];
     let tmp = cx.gpu.buffer(w * h);
-    let (horizontal, vertical) = match r {
-        2 => ("median_h_2", "median_v_2"),
-        8 => ("median_h_8", "median_v_8"),
-        24 => ("median_h_24", "median_v_24"),
-        _ => ("median_h", "median_v"),
-    };
+    let (horizontal, vertical) = crate::ctx::MEDIAN_NETWORKS
+        .get(r - 1)
+        .copied()
+        .filter(|(horizontal, vertical)| cx.gpu.has_kernel(horizontal) && cx.gpu.has_kernel(vertical))
+        .unwrap_or(("median_h", "median_v"));
     cx.run(horizontal, &pr, &[Some(p), Some(&tmp)], groups2(w, h, [16, 16]));
     let out = cx.gpu.buffer(w * h);
     cx.run(vertical, &pr, &[Some(&tmp), Some(&out)], groups2(w, h, [16, 16]));
@@ -1484,9 +1483,13 @@ mod tests {
         };
         let _scope = crate::ctx::RenderScope::new(gpu);
         let values = [0xffc00012, 0xff800000, 0xbf800000, 0x80000000, 0, 0x3f800000, 0x7f800000, 0x7fc00012];
+        for (horizontal, vertical) in crate::ctx::MEDIAN_NETWORKS {
+            assert!(gpu.has_kernel(horizontal) && gpu.has_kernel(vertical), "network unavailable: {horizontal}, {vertical}");
+        }
         for (w, h) in [(1, 1), (3, 2), (17, 19), (32, 7), (49, 5)] {
             let input = Plane::from_fn(w, h, |x, y| f32::from_bits(values[(x * 7 + y * 3) % values.len()]));
-            for r in [1, 2, 8, 24] {
+            let radii: Vec<_> = if (w, h) == (17, 19) { (1..=24).collect() } else { vec![1, 2, 8, 24] };
+            for r in radii {
                 let expected = lightcraft_pipeline::local::median_hv(&input, r);
                 let mut cx = Cx::new(gpu);
                 let src = gpu.upload(&input.data);
