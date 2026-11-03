@@ -254,7 +254,13 @@ const CHUNK: usize = 16;
 fn box_pass(cx: &mut Cx<'_>, horizontal: bool, src: &Buf, dst: &Buf, (w, h): (usize, usize), nc: usize, r: usize) {
     let chunk = (2 * r + 1).clamp(CHUNK, 128);
     let p = [w as u32, h as u32, nc as u32, r as u32, chunk as u32];
-    let (k, groups) = if horizontal { ("box_h", groups2(w, h, [64, 4])) } else { ("box_v", groups2(w, h.div_ceil(chunk), [64, 4])) };
+    let (k, groups) = if horizontal && (32..=255).contains(&r) {
+        ("box_h_scan", groups2(w, h, [256, 1]))
+    } else if horizontal {
+        ("box_h", groups2(w, h, [64, 4]))
+    } else {
+        ("box_v", groups2(w, h.div_ceil(chunk), [64, 4]))
+    };
     cx.run(k, &p, &[Some(src), Some(dst)], groups);
 }
 
@@ -1916,6 +1922,62 @@ mod tests {
     }
 
     #[test]
+    fn box_horizontal_matches_cpu() {
+        let Some(gpu) = crate::device() else {
+            lightcraft_testkit::skip!(Gpu, "no GPU adapter for horizontal box parity");
+            return;
+        };
+        let _scope = crate::ctx::RenderScope::new(gpu);
+        let mut max_error = 0.0f32;
+        let mut max_exact_error = 0.0f64;
+        for w in [1usize, 7, 255, 256, 257, 513] {
+            let h = 3;
+            for nc in [1, 2, 3] {
+                let mut state = 0x1234_5678u32;
+                let input: Vec<f32> = (0..w * h * nc)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        (state >> 8) as f32 / 16_777_215.0
+                    })
+                    .collect();
+                for r in [1usize, 4, 32, 128, 255] {
+                    let src = gpu.upload(&input);
+                    let dst = gpu.buffer(input.len());
+                    let mut cx = Cx::new(gpu);
+                    box_pass(&mut cx, true, &src, &dst, (w, h), nc, r);
+                    let got: Vec<f32> = cx.read(&dst, input.len());
+                    for y in 0..h {
+                        for c in 0..nc {
+                            let pixel = |x: usize| input[(y * w + x) * nc + c];
+                            let mut acc = 0.0f32;
+                            for i in 0..=2 * r {
+                                acc += pixel(i.saturating_sub(r).min(w - 1));
+                            }
+                            for x in 0..w {
+                                let want = acc * (1.0 / (2 * r + 1) as f32);
+                                let error = (got[(y * w + x) * nc + c] - want).abs();
+                                max_error = max_error.max(error);
+                                assert!(error < 1e-5 * (1.0 + r as f32 / 10.0), "w={w} nc={nc} r={r} x={x}: {error}");
+                                let exact =
+                                    (0..=2 * r).map(|i| f64::from(pixel((x + i).saturating_sub(r).min(w - 1)))).sum::<f64>() / (2 * r + 1) as f64;
+                                let exact_error = (f64::from(got[(y * w + x) * nc + c]) - exact).abs();
+                                max_exact_error = max_exact_error.max(exact_error);
+                                assert!(exact_error < 1e-5 * (1.0 + r as f64 / 10.0), "w={w} nc={nc} r={r} x={x}: {exact_error}");
+                                acc = acc + pixel((x + r + 1).min(w - 1)) - pixel(x.saturating_sub(r));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("maximum horizontal CPU/GPU error: {max_error:e}");
+        eprintln!("maximum horizontal f64/GPU error: {max_exact_error:e}");
+    }
+
+    /// Kernel timings on a 24 MP plane: `cargo test --release -p lightcraft-gpu -- --ignored --nocapture`.
+    #[test]
     #[ignore]
     fn bench_kernels() {
         // (creating the device writes the crash sentinel another test swaps out)
@@ -1940,10 +2002,19 @@ mod tests {
         for nc in [1, 2, 3] {
             let out = gpu.buffer(w * h * nc);
             // noise reduction's radii, Texture's and Dehaze's at 6000 px
-            for r in [2, 11, 120] {
+            for r in [4, 32, 128] {
                 for (k, horizontal) in [("box_h", true), ("box_v", false)] {
                     time(&format!("{k} nc={nc} r={r}"), &mut |cx| box_pass(cx, horizontal, &src, &out, (w, h), nc, r));
                 }
+            }
+        }
+        let out = gpu.buffer(w * h);
+        for r in [8usize, 16, 32] {
+            let p = [w as u32, h as u32, 1, r as u32, 0];
+            for (kernel, shape) in [("box_h", [64, 4]), ("box_h_scan", [256, 1])] {
+                time(&format!("{kernel} crossover r={r}"), &mut |cx| {
+                    cx.run(kernel, &p, &[Some(&src), Some(&out)], groups2(w, h, shape));
+                });
             }
         }
         for nc in [1, 2, 3] {

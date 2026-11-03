@@ -48,6 +48,58 @@ fn box_h(@builtin(global_invocation_id) g: vec3<u32>) {
     st(row + x, nc, acc * (1.0 / f32(2 * r + 1)));
 }
 
+// A Blelloch exclusive scan, including the duplicated clamped halo. For inputs bounded by B,
+// a conservative f32 absolute error bound for a scan result is 2 * gamma_22 * 1024 * B, divided by
+// the box width (gamma_n = n*u/(1-n*u), u = 2^-24); endpoint subtraction adds rounding. The CPU's
+// f32 running sum has its own row-length-dependent error, so this is not a bitwise comparison.
+// Tests compare against that reference at its existing radius-scaled tolerance and include HDR in
+// the Gaussian parity test. Radii beyond 255 retain the direct path to bound shared storage.
+var<workgroup> scan: array<vec3<f32>, 1024>;
+
+@compute @workgroup_size(256)
+fn box_h_scan(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    let w = pu(0u);
+    let nc = pu(2u);
+    let r = pu(3u);
+    let size = select(1024u, 512u, r <= 128u);
+    let start = i32(group.x * 256u) - i32(r);
+    let row = group.y * w;
+    for (var i = lane; i < size; i += 256u) {
+        scan[i] = ld(row + u32(clamp(start + i32(i), 0, i32(w) - 1)), nc);
+    }
+    workgroupBarrier();
+    var stride = 1u;
+    loop {
+        if (stride >= size) { break; }
+        for (var i = lane; i < size / (2u * stride); i += 256u) {
+            let right = (i + 1u) * 2u * stride - 1u;
+            scan[right] += scan[right - stride];
+        }
+        workgroupBarrier();
+        stride *= 2u;
+    }
+    if (lane == 0u) { scan[size - 1u] = vec3<f32>(0.0); }
+    workgroupBarrier();
+    loop {
+        stride /= 2u;
+        for (var i = lane; i < size / (2u * stride); i += 256u) {
+            let right = (i + 1u) * 2u * stride - 1u;
+            let left = right - stride;
+            let value = scan[left];
+            scan[left] = scan[right];
+            scan[right] += value;
+        }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+    }
+    let x = group.x * 256u + lane;
+    if (x < w) {
+        let right = lane + 2u * r;
+        let end = ld(row + u32(clamp(start + i32(right), 0, i32(w) - 1)), nc);
+        st(row + x, nc, (scan[right] + end - scan[lane]) / f32(2u * r + 1u));
+    }
+}
+
 // Vertical: one thread per CH consecutive rows of a column (the CPU re-primes every BAND rows the
 // same way).
 @compute @workgroup_size(64, 4)
