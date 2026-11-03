@@ -30,7 +30,19 @@ const MODULES: &[Module] = &[
     Module {
         src: include_str!("wgsl/blur.wgsl"),
         bindings: &[("src", false, "f32"), ("dst", true, "f32")],
-        entries: &["box_h", "box_v", "minmax", "median_h", "median_v"],
+        entries: &[
+            "box_h",
+            "box_v",
+            "minmax",
+            "median_h",
+            "median_v",
+            "median_h_2",
+            "median_v_2",
+            "median_h_8",
+            "median_v_8",
+            "median_h_24",
+            "median_v_24",
+        ],
     },
     Module {
         src: include_str!("wgsl/gauss.wgsl"),
@@ -418,7 +430,89 @@ fn module_source(m: &Module, consts: &str) -> String {
     }
     s += include_str!("wgsl/common.wgsl");
     s += m.src;
+    if m.entries.contains(&"median_h") {
+        for radius in [2, 8, 24] {
+            s += &median_network_source(radius);
+        }
+    }
     s
+}
+
+fn median_comparators(radius: usize) -> Vec<(usize, usize, bool, bool)> {
+    fn merge(start: usize, len: usize, stride: usize, pairs: &mut Vec<(usize, usize)>) {
+        let step = stride * 2;
+        if step < len {
+            merge(start, len, step, pairs);
+            merge(start + stride, len, step, pairs);
+            for index in (start + stride..start + len - stride).step_by(step) {
+                pairs.push((index, index + stride));
+            }
+        } else {
+            pairs.push((start, start + stride));
+        }
+    }
+    fn sort(start: usize, len: usize, pairs: &mut Vec<(usize, usize)>) {
+        if len > 1 {
+            sort(start, len / 2, pairs);
+            sort(start + len / 2, len / 2, pairs);
+            merge(start, len, 1, pairs);
+        }
+    }
+    let len = (2 * radius + 1).next_power_of_two();
+    let mut pairs = Vec::new();
+    sort(0, len, &mut pairs);
+    let mut needed = vec![false; len];
+    needed[radius] = true;
+    let mut result = Vec::new();
+    for (low, high) in pairs.into_iter().rev() {
+        let (need_low, need_high) = (needed[low], needed[high]);
+        if need_low || need_high {
+            result.push((low, high, need_low, need_high));
+            needed[low] = true;
+            needed[high] = true;
+        }
+    }
+    result.reverse();
+    result
+}
+
+fn median_network_source(radius: usize) -> String {
+    use std::fmt::Write;
+    let count = 2 * radius + 1;
+    let len = count.next_power_of_two();
+    let width = 16 + 2 * radius;
+    let mut source = format!("\nvar<workgroup> median_tile_{radius}: array<u32, {}>;\n", width * 16);
+    for vertical in [false, true] {
+        let axis = if vertical { "v" } else { "h" };
+        let (along, across, limit, other_limit) = if vertical { ("g.y", "g.x", "h", "w") } else { ("g.x", "g.y", "w", "h") };
+        let (local_along, local_across) = if vertical { ("l.y", "l.x") } else { ("l.x", "l.y") };
+        let input = if vertical { "position * w + other" } else { "other * w + position" };
+        let _ = write!(
+            source,
+            "\n@compute @workgroup_size(16,16) fn median_{axis}_{radius}(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {{\nlet w = pu(0u); let h = pu(1u);\nfor (var k = {local_along}; k < {width}u; k += 16u) {{\nlet position = u32(clamp(i32({along} - {local_along} + k) - {radius}, 0, i32({limit}) - 1));\nlet other = min({across}, {other_limit} - 1u);\nmedian_tile_{radius}[{local_across} * {width}u + k] = median_key(src[{input}]);\n}}\nworkgroupBarrier();\nif (g.x >= w || g.y >= h) {{ return; }}\nvar v: array<u32, {len}>;\n"
+        );
+        for index in 0..len {
+            if index < count {
+                let _ = writeln!(source, "v[{index}] = median_tile_{radius}[{local_across} * {width}u + {local_along} + {index}u];");
+            } else {
+                let _ = writeln!(source, "v[{index}] = 0xffffffffu;");
+            }
+        }
+        for (index, (low, high, need_low, need_high)) in median_comparators(radius).into_iter().enumerate() {
+            let _ = writeln!(source, "let a{index} = v[{low}]; let b{index} = v[{high}];");
+            if need_low {
+                let _ = writeln!(source, "v[{low}] = min(a{index}, b{index});");
+            }
+            if need_high {
+                let _ = writeln!(source, "v[{high}] = max(a{index}, b{index});");
+            }
+        }
+        let _ = writeln!(
+            source,
+            "let key = v[{radius}]; let bits = key ^ select(0xffffffffu, 0x80000000u, (key & 0x80000000u) != 0u); dst[g.y * w + g.x] = bitcast<f32>(bits); }}"
+        );
+    }
+    source
 }
 
 impl Gpu {
@@ -1049,6 +1143,35 @@ pub fn groups1(n: usize) -> [u32; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn median_networks_select_exact_middle() {
+        for radius in [2, 8, 24] {
+            let comparators = super::median_comparators(radius);
+            eprintln!("r={radius}: {} comparators", comparators.len());
+            let count = radius * 2 + 1;
+            let mut seed = 1_u32;
+            for _ in 0..1000 {
+                let mut values = vec![u32::MAX; count.next_power_of_two()];
+                for value in &mut values[..count] {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *value = seed;
+                }
+                let mut sorted = values.clone();
+                sorted.sort_unstable();
+                for &(low, high, need_low, need_high) in &comparators {
+                    let (a, b) = (values[low], values[high]);
+                    if need_low {
+                        values[low] = a.min(b);
+                    }
+                    if need_high {
+                        values[high] = a.max(b);
+                    }
+                }
+                assert_eq!(values[radius], sorted[radius], "r={radius}");
+            }
+        }
+    }
+
     /// Every kernel module, as it is handed to the device (the generated constants, the bindings, `common.wgsl`, the
     /// module), parses and validates without a GPU.
     #[test]

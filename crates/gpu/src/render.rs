@@ -353,9 +353,15 @@ fn median_hv(cx: &mut Cx<'_>, p: &Buf, w: usize, h: usize, r: usize) -> Buf {
     }
     let pr = [w as u32, h as u32, 1, r.min(local::BASE_DETAIL_MAX) as u32];
     let tmp = cx.gpu.buffer(w * h);
-    cx.run("median_h", &pr, &[Some(p), Some(&tmp)], groups2(w, h, [16, 16]));
+    let (horizontal, vertical) = match r {
+        2 => ("median_h_2", "median_v_2"),
+        8 => ("median_h_8", "median_v_8"),
+        24 => ("median_h_24", "median_v_24"),
+        _ => ("median_h", "median_v"),
+    };
+    cx.run(horizontal, &pr, &[Some(p), Some(&tmp)], groups2(w, h, [16, 16]));
     let out = cx.gpu.buffer(w * h);
-    cx.run("median_v", &pr, &[Some(&tmp), Some(&out)], groups2(w, h, [16, 16]));
+    cx.run(vertical, &pr, &[Some(&tmp), Some(&out)], groups2(w, h, [16, 16]));
     out
 }
 
