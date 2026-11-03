@@ -1471,6 +1471,55 @@ mod tests {
 
     /// Kernel timings on a 24 MP plane: `cargo test --release -p lightcraft-gpu -- --ignored --nocapture`.
     #[test]
+    fn median_matches_cpu_total_order() {
+        let Some(gpu) = crate::device() else {
+            lightcraft_testkit::skip!(Gpu, "no GPU adapter for median parity");
+            return;
+        };
+        let _scope = crate::ctx::RenderScope::new(gpu);
+        let values = [0xffc00012, 0xff800000, 0xbf800000, 0x80000000, 0, 0x3f800000, 0x7f800000, 0x7fc00012];
+        for (w, h) in [(1, 1), (3, 2), (17, 19), (32, 7), (49, 5)] {
+            let input = Plane::from_fn(w, h, |x, y| f32::from_bits(values[(x * 7 + y * 3) % values.len()]));
+            for r in [1, 2, 8, 24] {
+                let expected = lightcraft_pipeline::local::median_hv(&input, r);
+                let mut cx = Cx::new(gpu);
+                let src = gpu.upload(&input.data);
+                let out = median_hv(&mut cx, &src, w, h, r);
+                let actual: Vec<f32> = cx.read(&out, w * h);
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{w}x{h} r={r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_median_29() {
+        let Some(gpu) = crate::device() else { return };
+        let _scope = crate::ctx::RenderScope::new(gpu);
+        let (w, h) = (6000, 4000);
+        let input = Plane::from_fn(w, h, |x, y| ((x * 37 + y * 73) % 256) as f32 / 255.0);
+        let src = gpu.upload(&input.data);
+        eprintln!("median benchmark: {} ({:?})", gpu.info.name, gpu.info.backend);
+        for r in [2, 8, 24] {
+            let start = std::time::Instant::now();
+            let result = lightcraft_pipeline::local::median_hv(&input, r);
+            eprintln!("cpu r={r}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(result);
+            let mut cx = Cx::new(gpu);
+            cx.sync();
+            let start = std::time::Instant::now();
+            let result = median_hv(&mut cx, &src, w, h, r);
+            cx.sync();
+            eprintln!("gpu r={r}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(result);
+        }
+    }
+
+    #[test]
     #[ignore]
     fn bench_kernels() {
         // (creating the device writes the crash sentinel another test swaps out)

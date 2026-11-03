@@ -114,14 +114,20 @@ fn minmax(@builtin(global_invocation_id) g: vec3<u32>) {
 
 // Separable median of a single-channel plane (`lightcraft_pipeline::local::median_hv`): 2r+1
 // taps (r ≤ 24, clamped edges) along a row (median_h) or a column (median_v), one thread per
-// pixel. The median is a selection, so the result matches the CPU's bit for bit.
+// pixel. Order f32 bit patterns exactly as Rust's total_cmp: negative NaNs precede negative
+// infinity, -0 precedes +0, and positive NaNs follow positive infinity; NaN payloads are retained.
 // P: w, h, nc (unused), r.
+fn median_key(v: f32) -> u32 {
+    let bits = bitcast<u32>(v);
+    return bits ^ select(0x80000000u, 0xffffffffu, (bits & 0x80000000u) != 0u);
+}
+
 fn median_of(n: u32, r: u32, v: ptr<function, array<f32, 49>>) -> f32 {
     // partial selection sort up to the middle
     for (var i = 0u; i <= r; i++) {
         var m = i;
         for (var j = i + 1u; j < n; j++) {
-            if ((*v)[j] < (*v)[m]) {
+            if (median_key((*v)[j]) < median_key((*v)[m])) {
                 m = j;
             }
         }
