@@ -47,6 +47,9 @@ fn every_dialog_is_a_modal_dialog_with_its_title() {
 #[test]
 fn settings_is_a_dialog_too() {
     let mut h = harness();
+    // Settings can contain Georgian text from its fixture, but this assertion is
+    // about the accessibility role and modal state, not glyph coverage.
+    h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
     h.state_mut().run("app.settings", serde_json::json!({})).expect("Settings opens");
     h.run_steps(6);
     let found = windows(&h);
