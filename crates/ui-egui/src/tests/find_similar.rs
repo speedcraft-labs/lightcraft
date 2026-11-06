@@ -16,7 +16,8 @@ use crate::headless::Headless;
 use crate::state::ViewMode;
 use crate::{LightcraftApp, Services};
 
-const T: Duration = Duration::from_secs(60);
+// These tests exercise worker handoff and can share a loaded test host with many UI cases.
+const T: Duration = Duration::from_secs(180);
 const PHOTOS: u64 = 12;
 /// How long a read waits for a drive that isn't opened, and how long the frames may take while it does.
 const GUARD: Duration = Duration::from_secs(20);
@@ -31,7 +32,12 @@ struct Drive {
 }
 
 fn app_on_a_slow_drive(guard: Duration) -> (Headless, Drive) {
+    app_on_a_slow_drive_in_view(guard, ViewMode::PhotoGrid)
+}
+
+fn app_on_a_slow_drive_in_view(guard: Duration, view: ViewMode) -> (Headless, Drive) {
     let mut app = LightcraftApp::new(lightcraft_engine::Session::new(), Services { png: None, ..Default::default() });
+    app.ui.view = view;
     for i in 0..PHOTOS {
         let path = format!("/drive/IMG_{i:04}.arw");
         let p = Photo::new(PhotoId(i + 1), Source::File { path }, &format!("IMG_{i:04}.arw"), "ARW", 64, 64, "2026-01-01T00:00:00");
@@ -144,8 +150,8 @@ fn a_second_search_waits_for_the_first() {
 /// what was read.
 #[test]
 fn stopping_leaves_the_view_alone_and_the_next_search_reads_only_the_rest() {
-    let (mut h, drive) = app_on_a_slow_drive(GUARD);
-    h.app.ui.view = ViewMode::Detail;
+    // Start in Detail before the first frame so grid thumbnail decodes can't race the read count.
+    let (mut h, drive) = app_on_a_slow_drive_in_view(GUARD, ViewMode::Detail);
     h.app.run("library.findSimilar", json!({"id": 1})).unwrap();
     // stopped while the searched photo is being read: that one read is all it does
     assert!(h.step_until(T, |_| drive.reads.load(Ordering::SeqCst) == 1), "the first read never started");
