@@ -11,7 +11,8 @@ use crate::state::{Dialog, UiState};
 use crate::{LightcraftApp, Services};
 use lightcraft_engine::import::ImportCandidate;
 
-const T: Duration = Duration::from_secs(30);
+// Preview decoding can be heavily contended during the full UI suite on shared Linux CI hosts.
+const T: Duration = Duration::from_secs(180);
 
 /// Size buckets follow physical pixels, with finite fallbacks and a fixed allocation ceiling.
 #[test]

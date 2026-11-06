@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Headless egui tests spin up CPU render workers. Running one test per detected CPU
+# oversubscribes shared Linux CI hosts and makes their render deadlines flaky.
+[env]
+RUST_TEST_THREADS = { value = "4", force = false }

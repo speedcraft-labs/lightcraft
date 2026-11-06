@@ -10,7 +10,8 @@ use crate::panels::activity::{WIDTH, count_text};
 use crate::{LightcraftApp, Services};
 
 // generous: merges and renders run on worker threads that a busy machine (a full workspace test run) slows a lot
-const T: Duration = Duration::from_secs(60);
+// Merge fixtures exercise CPU-heavy image work. Allow them to settle on shared Linux CI hosts.
+const T: Duration = Duration::from_secs(180);
 
 fn demo() -> Headless {
     let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services { png: None, ..Default::default() });

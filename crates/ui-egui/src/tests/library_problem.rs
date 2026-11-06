@@ -11,7 +11,7 @@ use crate::panels::library_problem::LibraryProblem;
 use crate::tests_fixtures::SyntheticLibrary;
 use crate::{LightcraftApp, Services};
 
-const T: Duration = Duration::from_secs(20);
+const T: Duration = Duration::from_secs(120);
 
 fn has(h: &Headless, id: &str) -> bool {
     h.app.widgets.iter().any(|(w, _)| w == id)
@@ -167,7 +167,7 @@ fn a_backdrop_press_keeps_the_library_window_above_its_dim() {
     let files = SyntheticLibrary::new("library-backdrop-press");
     let mut h = Headless::new(files.app(), [1000.0, 760.0], 1.0);
     h.app.library_problem = Some(LibraryProblem::new("/no/such/library", "a test error"));
-    assert!(h.settle(Duration::from_secs(20)), "the library window settles (pending slots: {:?})", h.app.renderer.pending_slots());
+    assert!(h.settle(Duration::from_secs(120)), "the library window settles (pending slots: {:?})", h.app.renderer.pending_slots());
     assert!(has(&h, "button:libraryTemporary"), "the window is laid out");
     // Outside the centred window: on the full-screen dim, which egui raises when pressed.
     let at = egui::pos2(10.0, 10.0);
@@ -194,10 +194,10 @@ fn the_library_window_blocks_settings_escape_and_the_backdrop() {
     let mut h = Headless::new(files.app(), [1200.0, 900.0], 1.0);
     h.step();
     assert!(h.app.run("app.settings", json!({})).is_ok(), "Settings opens");
-    assert!(h.settle(Duration::from_secs(20)), "Settings settles (pending slots: {:?})", h.app.renderer.pending_slots());
+    assert!(h.settle(Duration::from_secs(120)), "Settings settles (pending slots: {:?})", h.app.renderer.pending_slots());
     h.app.ui.settings.close_dialogs_outside = true;
     h.app.library_problem = Some(LibraryProblem::new("/no/such/library", "a test error"));
-    assert!(h.settle(Duration::from_secs(20)), "the library window settles (pending slots: {:?})", h.app.renderer.pending_slots());
+    assert!(h.settle(Duration::from_secs(120)), "the library window settles (pending slots: {:?})", h.app.renderer.pending_slots());
     assert!(has(&h, "button:libraryRetry"), "the library window is laid out");
     // Escape belongs to the window, not to Settings behind it (the window has no Escape action
     // for this error; the launch list handles its own keys separately).
