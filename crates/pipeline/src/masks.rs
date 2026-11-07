@@ -12,6 +12,7 @@ use lightcraft_raster::{Image, Plane, Rgb32f};
 
 use crate::for_rows;
 use crate::geometry::Frame;
+use crate::local::Blur;
 
 /// What an embedded segmentation matte selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,10 +142,25 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
 /// The visible masks with components, evaluated in order (`mattes`: the source's, see [`Mattes`]).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(masks: &[Mask], frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Vec<Evaluated> {
+    evaluate_with_blur(masks, frame, w, h, img, log_l, ev, mattes, Blur::Legacy)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_with_blur(
+    masks: &[Mask],
+    frame: &Frame,
+    w: usize,
+    h: usize,
+    img: &Rgb32f,
+    log_l: &Plane,
+    ev: f32,
+    mattes: Option<&Mattes>,
+    blur: Blur,
+) -> Vec<Evaluated> {
     masks
         .iter()
         .filter(|m| m.visible && !m.components.is_empty())
-        .map(|m| Evaluated { id: m.id, alpha: evaluate_one(m, frame, w, h, img, log_l, ev, mattes), adjust: m.adjust })
+        .map(|m| Evaluated { id: m.id, alpha: evaluate_one_with_blur(m, frame, w, h, img, log_l, ev, mattes, blur), adjust: m.adjust })
         .collect()
 }
 
@@ -152,12 +168,27 @@ pub fn evaluate(masks: &[Mask], frame: &Frame, w: usize, h: usize, img: &Rgb32f,
 /// scaled by its amount.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Plane {
+    evaluate_one_with_blur(m, frame, w, h, img, log_l, ev, mattes, Blur::Legacy)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_one_with_blur(
+    m: &Mask,
+    frame: &Frame,
+    w: usize,
+    h: usize,
+    img: &Rgb32f,
+    log_l: &Plane,
+    ev: f32,
+    mattes: Option<&Mattes>,
+    blur: Blur,
+) -> Plane {
     // its coordinates on the photo before the warp, or (an old mask) on the corrected frame
     let frame = &*frame.for_mask(m.on_photo);
     let mut alpha = Plane::new(w, h);
     let mut first = true;
     for comp in &m.components {
-        let mut c = shape_alpha(&comp.shape, frame, w, h, img, log_l, ev, mattes);
+        let mut c = shape_alpha_with_blur(&comp.shape, frame, w, h, img, log_l, ev, mattes, blur);
         if comp.invert {
             c.data.iter_mut().for_each(|v| *v = 1.0 - *v);
         }
@@ -180,7 +211,7 @@ pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, l
         // the width of a soft brush edge or gradient)
         let k = (m.refine / 100.0).clamp(0.0, 1.0) as f32;
         let sigma = (0.04 * frame.output_long(w, h) as f32 * k).max(1.0);
-        let refined = guided_cross(log_l, &alpha, sigma, 0.02);
+        let refined = guided_cross_with_blur(log_l, &alpha, sigma, 0.02, blur);
         for (a, r) in alpha.data.iter_mut().zip(&refined.data) {
             *a += (r - *a) * k.sqrt();
         }
@@ -210,6 +241,21 @@ fn for_each_pos(frame: &Frame, w: usize, h: usize, out: &mut Plane, f: impl Fn(P
 /// The alpha plane of one component shape. AI shapes use the source's matching `mattes`, if any.
 #[allow(clippy::too_many_arguments)]
 pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Plane {
+    shape_alpha_with_blur(shape, frame, w, h, img, log_l, ev, mattes, Blur::Legacy)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_alpha_with_blur(
+    shape: &MaskShape,
+    frame: &Frame,
+    w: usize,
+    h: usize,
+    img: &Rgb32f,
+    log_l: &Plane,
+    ev: f32,
+    mattes: Option<&Mattes>,
+    blur: Blur,
+) -> Plane {
     let fitting = mattes.map(|m| m.for_shape(shape)).unwrap_or_default();
     if !fitting.is_empty() {
         return matte_alpha(&fitting, frame, w, h);
@@ -242,7 +288,7 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
                 if inv { 1.0 - a } else { a }
             });
         }
-        MaskShape::Brush { strokes } => rasterize_brush(strokes, frame, w, h, img, log_l, &mut out),
+        MaskShape::Brush { strokes } => rasterize_brush(strokes, frame, w, h, img, log_l, &mut out, blur),
         MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather } => {
             let (lo, hi, lf, hf) = (*lo as f32, *hi as f32, (*lo_feather as f32).max(1e-3), (*hi_feather as f32).max(1e-3));
             for (v, l) in out.data.iter_mut().zip(&log_l.data) {
@@ -278,16 +324,16 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
                 let top = 1.0 - smooth(0.25, 0.7, n.y as f32);
                 *v = top * smooth(-3.5, -1.0, l) * (0.4 + 0.6 * smooth(0.0, 0.3, blue).max(smooth(0.0, 1.5, l)));
             }
-            smooth_plane(&mut out, 0.01 * frame_px(frame, w));
+            smooth_plane(&mut out, 0.01 * frame_px(frame, w), blur);
         }
         MaskShape::Object { seg, detail, edge, .. } | MaskShape::Prompt { seg, detail, edge, .. } if seg.is_some() || !detail.is_empty() => {
             // Edge: below 0 a steeper transition (up to 8× the logits), above 0 feathered (up to
             // 2 % of the long edge, so previews and exports match)
             let e = (*edge / 100.0).clamp(-1.0, 1.0) as f32;
             let gain = if e < 0.0 { 1.0 - 7.0 * e } else { 1.0 };
-            sample_seg(seg.as_ref(), detail, gain, frame, w, h, log_l, &mut out);
+            sample_seg(seg.as_ref(), detail, gain, frame, w, h, log_l, &mut out, blur);
             if e > 0.0 {
-                smooth_plane(&mut out, e * 0.02 * frame_px(frame, w));
+                smooth_plane(&mut out, e * 0.02 * frame_px(frame, w), blur);
             }
         }
         // not computed yet (no clicks, or a build without the model): nothing selected
@@ -296,18 +342,18 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
         MaskShape::Subject | MaskShape::Object { .. } | MaskShape::People { .. } => {
             // Saliency heuristic: centre-weighted local contrast (replaced by the segmenter in M12).
             let m = frame.out_to_mask(w, h);
-            let blur = lightcraft_raster::blur::gaussian(log_l, 0.03 * frame_px(frame, w));
+            let blurred = blur.gaussian(log_l, 0.03 * frame_px(frame, w));
             for (i, v) in out.data.iter_mut().enumerate() {
                 let (x, y) = (i % w, i / w);
                 let n = m.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
                 let d = (((n.x - 0.5) / 0.35).powi(2) + ((n.y - 0.55) / 0.4).powi(2)).sqrt() as f32;
-                let contrast = (log_l.data[i] - blur.data[i]).abs();
+                let contrast = (log_l.data[i] - blurred.data[i]).abs();
                 *v = (1.0 - smooth(0.6, 1.0, d)) * (0.5 + 0.5 * smooth(0.05, 0.6, contrast));
             }
-            smooth_plane(&mut out, 0.015 * frame_px(frame, w));
+            smooth_plane(&mut out, 0.015 * frame_px(frame, w), blur);
         }
         MaskShape::Background => {
-            let mut s = shape_alpha(&MaskShape::Subject, frame, w, h, img, log_l, ev, mattes);
+            let mut s = shape_alpha_with_blur(&MaskShape::Subject, frame, w, h, img, log_l, ev, mattes, blur);
             s.data.iter_mut().for_each(|v| *v = 1.0 - *v);
             out = s;
         }
@@ -380,7 +426,7 @@ const SEG_EPS: f32 = 0.01;
 /// as do those where the photo has no edge to follow. Refine Edges
 /// then works on the combined mask ([`evaluate_one`]) and finds these edges already in place.
 #[allow(clippy::too_many_arguments)]
-fn sample_seg(seg: Option<&SegMask>, detail: &[SegMask], gain: f32, frame: &Frame, w: usize, h: usize, log_l: &Plane, out: &mut Plane) {
+fn sample_seg(seg: Option<&SegMask>, detail: &[SegMask], gain: f32, frame: &Frame, w: usize, h: usize, log_l: &Plane, out: &mut Plane, blur: Blur) {
     let coarse = seg.and_then(SegGrid::new);
     // (capped: a hostile document can hold many)
     let patches: Vec<SegGrid> = detail.iter().take(lightcraft_develop::segmask::MAX_DETAIL).filter_map(SegGrid::new).collect();
@@ -398,7 +444,7 @@ fn sample_seg(seg: Option<&SegMask>, detail: &[SegMask], gain: f32, frame: &Fram
     // (the coarsest grid sets the window: it leaves the widest uncertain band)
     let cell = coarse.iter().chain(&patches).map(|g| g.cell_px(frame, w)).fold(0.0, f64::max);
     if cell >= 1.0 {
-        guided_cross_fast(log_l, out, (SEG_WINDOW * cell) as f32, SEG_EPS, |mean| 1.0 - smooth(3.0 * gain, 7.0 * gain, mean.abs()));
+        guided_cross_fast(log_l, out, (SEG_WINDOW * cell) as f32, SEG_EPS, |mean| 1.0 - smooth(3.0 * gain, 7.0 * gain, mean.abs()), blur);
     }
     out.map_in_place(|l| 1.0 / (1.0 + (-l).exp()));
 }
@@ -407,8 +453,8 @@ fn frame_px(frame: &Frame, w: usize) -> f32 {
     frame.px_per_long(w) as f32
 }
 
-fn smooth_plane(p: &mut Plane, sigma: f32) {
-    *p = lightcraft_raster::blur::gaussian(p, sigma.max(0.5));
+fn smooth_plane(p: &mut Plane, sigma: f32, blur: Blur) {
+    *p = blur.gaussian(p, sigma.max(0.5));
 }
 
 /// The union (max) of `mattes` (0..255, over the EXIF-oriented source) at output resolution,
@@ -741,8 +787,8 @@ struct Guided {
 
 /// The guided filter (He, Sun and Tang) of `p` steered by `guide`, both the same size: Gaussian
 /// windows of `sigma` px, `eps` the regularization (in guide units squared).
-fn guided_coeffs(guide: &Plane, p: &Plane, sigma: f32, eps: f32, with_edge: bool) -> Guided {
-    use lightcraft_raster::blur::gaussian;
+fn guided_coeffs(guide: &Plane, p: &Plane, sigma: f32, eps: f32, with_edge: bool, blur: Blur) -> Guided {
+    let gaussian = |image: &Plane, sigma| blur.gaussian(image, sigma);
     let mi = gaussian(guide, sigma);
     let mp = gaussian(p, sigma);
     let cip = gaussian(&guide.zip_map(p, |a, b| a * b), sigma);
@@ -765,7 +811,11 @@ fn guided_coeffs(guide: &Plane, p: &Plane, sigma: f32, eps: f32, with_edge: bool
 /// Guided filter of `p` steered by `guide` (He et al.), clamped to 0..1: `p`'s edges snap to the
 /// guide's.
 pub fn guided_cross(guide: &Plane, p: &Plane, sigma: f32, eps: f32) -> Plane {
-    let g = guided_coeffs(guide, p, sigma, eps, false);
+    guided_cross_with_blur(guide, p, sigma, eps, Blur::Legacy)
+}
+
+fn guided_cross_with_blur(guide: &Plane, p: &Plane, sigma: f32, eps: f32, blur: Blur) -> Plane {
+    let g = guided_coeffs(guide, p, sigma, eps, false, blur);
     let mut q = Plane::new(p.width, p.height);
     for i in 0..q.data.len() {
         q.data[i] = (g.a.data[i] * guide.data[i] + g.b.data[i]).clamp(0.0, 1.0);
@@ -782,7 +832,7 @@ pub fn guided_cross(guide: &Plane, p: &Plane, sigma: f32, eps: f32) -> Plane {
 /// edge the guide has there (0 keeps it exactly: where the photo is flat the filter could only
 /// blur `p`). Extra memory: the reduced planes only (the coefficients are sampled per pixel, not
 /// enlarged into planes).
-fn guided_cross_fast(guide: &Plane, p: &mut Plane, sigma: f32, eps: f32, weight: impl Fn(f32) -> f32 + Sync + Send) {
+fn guided_cross_fast(guide: &Plane, p: &mut Plane, sigma: f32, eps: f32, weight: impl Fn(f32) -> f32 + Sync + Send, blur: Blur) {
     use lightcraft_raster::resample::{Filter, resize};
     let (w, h) = (p.width, p.height);
     if guide.width != w || guide.height != h || w == 0 || h == 0 || !sigma.is_finite() {
@@ -792,7 +842,7 @@ fn guided_cross_fast(guide: &Plane, p: &mut Plane, sigma: f32, eps: f32, weight:
     let sigma = sigma.clamp(0.5, w.max(h) as f32);
     let s = crate::local::guided_fast_step(sigma);
     let (lw, lh) = (w.div_ceil(s).max(1), h.div_ceil(s).max(1));
-    let g = guided_coeffs(&resize(guide, lw, lh, Filter::Box), &resize(p, lw, lh, Filter::Box), sigma / s as f32, eps, true);
+    let g = guided_coeffs(&resize(guide, lw, lh, Filter::Box), &resize(p, lw, lh, Filter::Box), sigma / s as f32, eps, true, blur);
     let Some(edge) = &g.edge else {
         return;
     };
@@ -816,7 +866,8 @@ fn guided_cross_fast(guide: &Plane, p: &mut Plane, sigma: f32, eps: f32, weight:
 /// Stamp brush strokes into `out` (max-combine; erase strokes subtract). Auto Mask strokes weight
 /// each dab by [`auto_similarity`] to the pixel under its centre and are refined with
 /// [`guided_cross`] on log luminance.
-fn rasterize_brush(strokes: &[BrushStroke], frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, out: &mut Plane) {
+#[allow(clippy::too_many_arguments)]
+fn rasterize_brush(strokes: &[BrushStroke], frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, out: &mut Plane, blur: Blur) {
     if w == 0 || h == 0 {
         return;
     }
@@ -851,7 +902,7 @@ fn rasterize_brush(strokes: &[BrushStroke], frame: &Frame, w: usize, h: usize, i
         }
         if auto {
             let (sigma, eps) = auto_refine(bd.r);
-            let q = guided_cross(log_l, &stroke_alpha, sigma, eps);
+            let q = guided_cross_with_blur(log_l, &stroke_alpha, sigma, eps, blur);
             // the refinement fills gaps along edges; it never takes paint away
             stroke_alpha = stroke_alpha.zip_map(&q, f32::max);
         }

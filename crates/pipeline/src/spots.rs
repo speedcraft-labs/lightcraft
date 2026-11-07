@@ -15,6 +15,7 @@ use lightcraft_geom::Point;
 use lightcraft_raster::Rgb32f;
 
 use crate::geometry::Frame;
+use crate::local::Blur;
 
 #[inline]
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
@@ -385,6 +386,10 @@ fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh
 
 /// Apply all spots to `img` (output resolution). `ppl` = output pixels per long-edge unit.
 pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
+    apply_with_blur(img, spots, frame, ppl, Blur::Legacy)
+}
+
+pub fn apply_with_blur(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64, blur: Blur) {
     let (w, h) = (img.width, img.height);
     for spot in spots {
         let Some(SpotLayout { r, pts, offset, bx: bx0, by: by0, bw, bh, inner, opacity, heal, fill }) = layout(spot, frame, w, h, ppl) else {
@@ -419,7 +424,7 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             };
             let wts = lightcraft_raster::Plane { width: bw, height: bh, data: outside };
             let sigma = (r * 0.6).max(1.0);
-            let (bd, bm) = (lightcraft_raster::blur::gaussian(&diff, sigma), lightcraft_raster::blur::gaussian(&wts, sigma));
+            let (bd, bm) = (blur.gaussian(&diff, sigma), blur.gaussian(&wts, sigma));
             Some(Rgb32f {
                 width: bw,
                 height: bh,

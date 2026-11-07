@@ -342,7 +342,7 @@ pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
         },
         // Keep V2 Whites in the camera curve; calibrated Contrast and Blacks follow it.
-        Process::V4 => match info.camera_tone.as_ref().filter(|_| info.raw) {
+        Process::V4 | Process::V5 => match info.camera_tone.as_ref().filter(|_| info.raw) {
             Some(curve) => ToneMap::camera_hdr(curve, 0.0, l.whites, 0.0, peak),
             None if info.raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),

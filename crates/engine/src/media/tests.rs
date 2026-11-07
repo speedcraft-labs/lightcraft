@@ -121,6 +121,7 @@ fn old_relative_white_balance_on_a_kelvin_camera_keeps_its_look_and_learns_the_a
     p.meta.camera = "SONY ILCE-7M3".into();
     p.as_shot_wb = Some((6500.0, 0.0));
     let mut d = lightcraft_develop::DevelopSettings::for_raw(6500.0, 0.0);
+    d.process = lightcraft_develop::Process::V2.version();
     (d.wb.mode, d.wb.temp, d.wb.tint) = (WbMode::Custom, 5800.0, 3.0);
     assert_eq!(d.wb.scale, WbScale::Legacy);
     p.develop = Arc::new(d.clone());

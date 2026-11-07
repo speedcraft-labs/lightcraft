@@ -79,11 +79,13 @@ fn v1_is_left_out_when_saving_and_other_processes_are_kept() {
     let mut s = DevelopSettings::from_json(&legacy()).unwrap();
     assert!(s.to_json().get("process").is_none());
     let before = s.hash64();
-    s.process = ProcessVersion(2);
-    let v = s.to_json();
-    assert_eq!(v["process"], json!(2));
-    assert_eq!(DevelopSettings::from_json(&v).unwrap().process, ProcessVersion(2));
-    assert_ne!(s.hash64(), before, "another process is another preview");
+    for process in [Process::V2, Process::V3] {
+        s.process = process.version();
+        let v = s.to_json();
+        assert_eq!(v["process"], json!(process.version().0));
+        assert_eq!(DevelopSettings::from_json(&v).unwrap().process, process.version());
+        assert_ne!(s.hash64(), before, "another process is another preview");
+    }
 }
 
 #[test]
