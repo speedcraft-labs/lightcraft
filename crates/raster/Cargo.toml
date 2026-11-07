@@ -9,6 +9,7 @@ description = "LightCraft raster (L0)"
 workspace = true
 
 [dependencies]
+craft-blur = { workspace = true }
 serde = { workspace = true }
 lightcraft-geom = { workspace = true }
 lightcraft-color = { workspace = true }

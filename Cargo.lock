@@ -1182,6 +1182,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-blur"
+version = "0.1.0"
+source = "git+https://github.com/speedcraft-labs/craft-libs?rev=fc15099447756b34714f46e86712fb91913c8405#fc15099447756b34714f46e86712fb91913c8405"
+
+[[package]]
 name = "craft-crw"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=f3b62ec61f45534392376492fc5ad33047375205#f3b62ec61f45534392376492fc5ad33047375205"
@@ -3939,6 +3944,7 @@ dependencies = [
 name = "lightcraft-raster"
 version = "0.18.0"
 dependencies = [
+ "craft-blur",
  "libc",
  "lightcraft-color",
  "lightcraft-geom",

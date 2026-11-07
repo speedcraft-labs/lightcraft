@@ -261,7 +261,7 @@ pub fn sharpen_plane(o: Overlay, s: &DevelopSettings, log_l: &Plane, band: Optio
                 let sigma = crate::local::sharpen_sigma(crate::local::sharpen_sigma_raw(s, px_per_long, native_long));
                 lightcraft_raster::blur::gaussian_taps(log_l, &lightcraft_raster::blur::gauss_taps(sigma))
             } else {
-                lightcraft_raster::blur::gaussian(log_l, crate::local::texture_sigma(px_per_long))
+                crate::local::Blur::for_settings(s).gaussian(log_l, crate::local::texture_sigma(px_per_long))
             };
             &own
         }
@@ -302,7 +302,7 @@ pub fn apply(img: &mut Rgba8, o: Overlay, plan: &Plan<'_>, plane: Option<&Plane>
                 point_color_range(img, &PointK::new(p));
             }
         }
-        Overlay::Spots(t) => spots(img, t, plan.px_per_long),
+        Overlay::Spots(t) => spots(img, t, plan.px_per_long, crate::local::Blur::for_settings(&plan.settings)),
         Overlay::Mask { view, color, opacity, .. } => {
             if let Some(a) = plane.filter(|a| (a.width, a.height) == (img.width, img.height)) {
                 mask_view(img, a, view, color, opacity);
@@ -405,7 +405,7 @@ pub fn spot_threshold(t: u8) -> f32 {
     0.01 + 0.2 * k * k
 }
 
-fn spots(img: &mut Rgba8, t: u8, ppl: f64) {
+fn spots(img: &mut Rgba8, t: u8, ppl: f64, blur: crate::local::Blur) {
     let (w, h) = (img.width, img.height);
     if w == 0 || h == 0 {
         return;
@@ -414,7 +414,7 @@ fn spots(img: &mut Rgba8, t: u8, ppl: f64) {
         let p = img.data[y * w + x];
         (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0
     });
-    let b = lightcraft_raster::blur::gaussian(&l, (SPOT_SIGMA * ppl).max(0.8) as f32);
+    let b = blur.gaussian(&l, (SPOT_SIGMA * ppl).max(0.8) as f32);
     let thr = spot_threshold(t);
     for (i, px) in img.data.iter_mut().enumerate() {
         let v = if (l.data[i] - b.data[i]).abs() > thr { 255 } else { 0 };
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn sharpening_preview_follows_the_process_radius_and_render_planes() {
         use lightcraft_develop::Process;
-        use lightcraft_raster::blur::{gaussian, gaussian_taps};
+        use lightcraft_raster::blur::gaussian_taps;
         let l = Plane { width: 80, height: 16, data: (0..1280).map(|i| ((i % 80) as f32 * 0.73).sin() * 0.3).collect() };
         let mut s = DevelopSettings::default();
         let mut bands = Vec::new();
@@ -624,7 +624,7 @@ mod tests {
                 let sigma = crate::local::sharpen_sigma(crate::local::sharpen_sigma_raw(&s, 80.0, 160.0));
                 gaussian_taps(&l, &lightcraft_raster::blur::gauss_taps(sigma))
             } else {
-                gaussian(&l, crate::local::texture_sigma(80.0))
+                crate::local::Blur::for_settings(&s).gaussian(&l, crate::local::texture_sigma(80.0))
             };
             for o in [Overlay::SharpenDetail, Overlay::SharpenMask] {
                 let cached = sharpen_plane(o, &s, &l, Some(&blur), 80.0, 160.0).unwrap();
@@ -666,6 +666,8 @@ mod tests {
         s.detail.sharpen_masking = 100.0;
         let m = shot(&s, Overlay::SharpenMask);
         assert_eq!((m.data[edge], m.data[flat]), ([255; 4], [0, 0, 0, 255]));
+        let legacy = DevelopSettings { process: lightcraft_develop::Process::V2.version(), ..s.clone() };
+        assert_eq!(shot(&legacy, Overlay::SharpenMask).data[edge], [255; 4]);
         // the same without sharpening on (the render has no texture plane then)
         s.detail.sharpen_amount = 0.0;
         assert_eq!(shot(&s, Overlay::SharpenMask), m);

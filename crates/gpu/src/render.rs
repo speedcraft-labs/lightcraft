@@ -259,7 +259,7 @@ fn box_pass(cx: &mut Cx<'_>, horizontal: bool, src: &Buf, dst: &Buf, (w, h): (us
 }
 
 /// Gaussian blur of a `w × h` image of `nc` interleaved channels: three box passes each way
-/// (`lightcraft_raster::blur::gaussian`).
+/// (`lightcraft_raster::blur::gaussian_box`); V3 CPU recursive filtering is not yet ported.
 pub(crate) fn gaussian(cx: &mut Cx<'_>, src: &Buf, w: usize, h: usize, nc: usize, sigma: f32) -> Buf {
     let Some(radii) = lightcraft_raster::blur::radii_for(sigma, w, h) else {
         return cx.copy(src);
@@ -1440,7 +1440,7 @@ mod tests {
         assert!(covered > 0 && covered < w * h, "{covered} px covered");
     }
 
-    /// The blur against `lightcraft_raster::blur::gaussian`: widths that do and don't fill the last
+    /// The blur against `lightcraft_raster::blur::gaussian_box`: widths that do and don't fill the last
     /// workgroup, windows wider than the image, and 1, 2 (as two planes) and 3 channels.
     #[test]
     fn gaussian_matches_cpu() {
@@ -1453,7 +1453,7 @@ mod tests {
         for (w, h) in [(1000, 5), (257, 3), (5, 4), (1, 9)] {
             for sigma in [0.8f32, 2.0, 4.5, 30.0, 250.0, 1000.0] {
                 let planes: Vec<Plane> = (0..3).map(|c| Plane::from_fn(w, h, |x, y| v(x, y, c))).collect();
-                let want: Vec<Plane> = planes.iter().map(|p| blur::gaussian(p, sigma)).collect();
+                let want: Vec<Plane> = planes.iter().map(|p| blur::gaussian_box(p, sigma)).collect();
                 for nc in [1, 2, 3] {
                     let words: Vec<f32> = (0..w * h).flat_map(|i| (0..nc).map(move |c| (i, c))).map(|(i, c)| planes[c].data[i]).collect();
                     let mut cx = Cx::new(gpu);
