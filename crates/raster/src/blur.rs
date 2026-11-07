@@ -176,7 +176,9 @@ pub(crate) fn shared_image<const N: usize, T: Pixel>(
     }
     filter.apply(&mut pixels, shape, Edge::Clamp, &mut Scratch::default(), Cancel::Never).ok()?;
     let mut out = Image::new(image.width, image.height);
-    out.data = pixels.chunks_exact(N).map(|values| narrow(std::array::from_fn(|i| f64::from(values[i])))).collect();
+    let (pixels, remainder) = pixels.as_chunks::<N>();
+    debug_assert!(remainder.is_empty());
+    out.data = pixels.iter().map(|values| narrow(std::array::from_fn(|i| f64::from(values[i])))).collect();
     Some(out)
 }
 
