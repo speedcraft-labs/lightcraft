@@ -1549,6 +1549,9 @@ mod tests {
         }));
         assert!(r.is_err());
         println!("CHILD: survived");
+        // After a simulated device loss, wgpu's process-wide teardown can segfault in the driver.
+        // This child is already the test boundary; exit after the assertions instead of tearing it down.
+        std::process::exit(0);
     }
 
     #[test]
