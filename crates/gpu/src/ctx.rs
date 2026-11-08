@@ -1411,6 +1411,9 @@ mod tests {
         super::SIMULATED_LOST_POLL.with(|c| c.set(false));
         assert!(super::read_texture(&g.device, &g.queue, &texture, 8, 8).is_err(), "a lost device is not polled again");
         println!("CHILD: survived");
+        // The simulated lost-device driver crashes during resource teardown, after every assertion
+        // has passed. Keep this child isolated and exit cleanly, as in `lost_poll_child` below.
+        std::process::exit(0);
     }
 
     /// A Metal device really lost (its command buffers exhausted) is never polled again.
