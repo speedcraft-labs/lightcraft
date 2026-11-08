@@ -254,7 +254,7 @@ const CHUNK: usize = 16;
 fn box_pass(cx: &mut Cx<'_>, horizontal: bool, src: &Buf, dst: &Buf, (w, h): (usize, usize), nc: usize, r: usize) {
     let chunk = (2 * r + 1).clamp(CHUNK, 128);
     let p = [w as u32, h as u32, nc as u32, r as u32, chunk as u32];
-    let (k, groups) = if horizontal && (32..=255).contains(&r) {
+    let (k, groups) = if horizontal && (96..=255).contains(&r) {
         ("box_h_scan", groups2(w, h, [256, 1]))
     } else if horizontal {
         ("box_h", groups2(w, h, [64, 4]))
@@ -1942,7 +1942,7 @@ mod tests {
                         (state >> 8) as f32 / 16_777_215.0
                     })
                     .collect();
-                for r in [1usize, 4, 32, 128, 255] {
+                for r in [1usize, 4, 32, 96, 128, 255] {
                     let src = gpu.upload(&input);
                     let dst = gpu.buffer(input.len());
                     let mut cx = Cx::new(gpu);
@@ -2009,7 +2009,7 @@ mod tests {
             }
         }
         let out = gpu.buffer(w * h);
-        for r in [8usize, 16, 32] {
+        for r in [8usize, 16, 32, 48, 64, 96, 128, 192, 255] {
             let p = [w as u32, h as u32, 1, r as u32, 0];
             for (kernel, shape) in [("box_h", [64, 4]), ("box_h_scan", [256, 1])] {
                 time(&format!("{kernel} crossover r={r}"), &mut |cx| {
