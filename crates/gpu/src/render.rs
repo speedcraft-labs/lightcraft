@@ -1494,7 +1494,7 @@ mod tests {
         }
     }
 
-    /// Kernel timings on a 24 MP plane: `cargo test --release -p lightcraft-gpu -- --ignored --nocapture`.
+    /// Paired GPU timings on 24 MP plus CPU 8/16-bit timings on 6 MP; run via `scripts/bench-run`.
     #[test]
     fn median_matches_cpu_total_order() {
         let Some(gpu) = crate::device() else {
@@ -1681,7 +1681,7 @@ mod tests {
             let ratios: Vec<f64> = new8_ms.iter().zip(old8_ms.iter()).map(|(n, o)| n / o).collect();
             let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
             eprintln!(
-                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u8\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u8\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
                 cpu_model,
                 kernel,
                 loadavg.trim(),
@@ -1710,7 +1710,7 @@ mod tests {
             let ratios: Vec<f64> = new16_ms.iter().zip(old16_ms.iter()).map(|(n, o)| n / o).collect();
             let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
             eprintln!(
-                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u16\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u16\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
                 cpu_model,
                 kernel,
                 loadavg.trim(),
