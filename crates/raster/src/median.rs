@@ -212,14 +212,8 @@ fn median_u16_sorted_line(src: &[u16], out: &mut [u16], radius: usize) {
     }
 }
 
-fn transpose<T: Copy + Default>(image: &Image<T>) -> Image<T> {
-    let mut out = Image::new(image.height, image.width);
-    for y in 0..image.height {
-        for x in 0..image.width {
-            out.set(y, x, image.get(x, y));
-        }
-    }
-    out
+fn transpose<T: Copy + Default + Send + Sync>(image: &Image<T>) -> Image<T> {
+    image.transpose()
 }
 
 struct U16Histogram {
