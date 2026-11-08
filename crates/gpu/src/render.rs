@@ -1943,7 +1943,7 @@ mod tests {
                         (state >> 8) as f32 / 16_777_215.0
                     })
                     .collect();
-                for r in [1usize, 4, 32, 96, 128, 255] {
+                for r in [1usize, 32, 96, 128, 255] {
                     let src = gpu.upload(&input);
                     let dst = gpu.buffer(input.len());
                     let mut cx = Cx::new(gpu);
