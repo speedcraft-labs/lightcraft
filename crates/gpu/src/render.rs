@@ -1923,6 +1923,7 @@ mod tests {
 
     #[test]
     fn box_horizontal_matches_cpu() {
+        let _serial = crate::DEVICE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(gpu) = crate::device() else {
             lightcraft_testkit::skip!(Gpu, "no GPU adapter for horizontal box parity");
             return;
