@@ -22,3 +22,4 @@ parallel = ["dep:rayon"]
 [dev-dependencies]
 proptest = { workspace = true }
 libc = { workspace = true }
+image = { workspace = true }

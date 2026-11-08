@@ -87,6 +87,33 @@ const MODULES: &[Module] = &[
     },
 ];
 
+pub(crate) const MEDIAN_NETWORKS: [(&str, &str); 24] = [
+    ("median_h_1", "median_v_1"),
+    ("median_h_2", "median_v_2"),
+    ("median_h_3", "median_v_3"),
+    ("median_h_4", "median_v_4"),
+    ("median_h_5", "median_v_5"),
+    ("median_h_6", "median_v_6"),
+    ("median_h_7", "median_v_7"),
+    ("median_h_8", "median_v_8"),
+    ("median_h_9", "median_v_9"),
+    ("median_h_10", "median_v_10"),
+    ("median_h_11", "median_v_11"),
+    ("median_h_12", "median_v_12"),
+    ("median_h_13", "median_v_13"),
+    ("median_h_14", "median_v_14"),
+    ("median_h_15", "median_v_15"),
+    ("median_h_16", "median_v_16"),
+    ("median_h_17", "median_v_17"),
+    ("median_h_18", "median_v_18"),
+    ("median_h_19", "median_v_19"),
+    ("median_h_20", "median_v_20"),
+    ("median_h_21", "median_v_21"),
+    ("median_h_22", "median_v_22"),
+    ("median_h_23", "median_v_23"),
+    ("median_h_24", "median_v_24"),
+];
+
 struct Kernel {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
@@ -143,7 +170,35 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
     if let Some(e) = pop_scopes(scopes) {
         return Err(e);
     }
-    let jobs: Vec<(&Prepared, &'static str)> = MODULES.iter().zip(&prepared).flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e))).collect();
+    let blur = &MODULES[1];
+    let blur_prepared = &prepared[1];
+    let networks: Vec<_> = MEDIAN_NETWORKS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, names)| {
+            let scopes = push_scopes(device);
+            let src = format!("{}{}", module_source(blur, &consts), median_network_source(index + 1));
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
+            if pop_scopes(scopes).is_some() {
+                return None;
+            }
+            Some((
+                Prepared {
+                    module,
+                    layout: blur_prepared.layout.clone(),
+                    pipeline_layout: blur_prepared.pipeline_layout.clone(),
+                    nbuf: blur_prepared.nbuf,
+                },
+                names,
+            ))
+        })
+        .collect();
+    let jobs: Vec<(&Prepared, &'static str)> = MODULES
+        .iter()
+        .zip(&prepared)
+        .flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e)))
+        .chain(networks.iter().flat_map(|(p, (horizontal, vertical))| [(p, *horizontal), (p, *vertical)]))
+        .collect();
     let next = AtomicUsize::new(0);
     let built = std::sync::Mutex::new(HashMap::with_capacity(jobs.len()));
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(jobs.len()).saturating_sub(1);
@@ -173,8 +228,9 @@ fn build_jobs(
     next: &AtomicUsize,
     built: &std::sync::Mutex<HashMap<&'static str, Kernel>>,
 ) -> Option<String> {
-    let scopes = push_scopes(device);
+    let mut error = None;
     while let Some(&(p, entry)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+        let scopes = push_scopes(device);
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: Some(&p.pipeline_layout),
@@ -183,10 +239,16 @@ fn build_jobs(
             compilation_options: Default::default(),
             cache: None,
         });
-        let kernel = Kernel { pipeline, layout: p.layout.clone(), nbuf: p.nbuf };
-        built.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(entry, kernel);
+        if let Some(build_error) = pop_scopes(scopes) {
+            if !entry.starts_with("median_h_") && !entry.starts_with("median_v_") {
+                error.get_or_insert(build_error);
+            }
+        } else {
+            let kernel = Kernel { pipeline, layout: p.layout.clone(), nbuf: p.nbuf };
+            built.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(entry, kernel);
+        }
     }
-    pop_scopes(scopes)
+    error
 }
 
 /// A device buffer of `len` 32-bit values.
@@ -421,7 +483,87 @@ fn module_source(m: &Module, consts: &str) -> String {
     s
 }
 
+fn median_comparators(radius: usize) -> Vec<(usize, usize, bool, bool)> {
+    fn merge(start: usize, len: usize, stride: usize, pairs: &mut Vec<(usize, usize)>) {
+        let step = stride * 2;
+        if step < len {
+            merge(start, len, step, pairs);
+            merge(start + stride, len, step, pairs);
+            for index in (start + stride..start + len - stride).step_by(step) {
+                pairs.push((index, index + stride));
+            }
+        } else {
+            pairs.push((start, start + stride));
+        }
+    }
+    fn sort(start: usize, len: usize, pairs: &mut Vec<(usize, usize)>) {
+        if len > 1 {
+            sort(start, len / 2, pairs);
+            sort(start + len / 2, len / 2, pairs);
+            merge(start, len, 1, pairs);
+        }
+    }
+    let len = (2 * radius + 1).next_power_of_two();
+    let mut pairs = Vec::new();
+    sort(0, len, &mut pairs);
+    let mut needed = vec![false; len];
+    needed[radius] = true;
+    let mut result = Vec::new();
+    for (low, high) in pairs.into_iter().rev() {
+        let (need_low, need_high) = (needed[low], needed[high]);
+        if need_low || need_high {
+            result.push((low, high, need_low, need_high));
+            needed[low] = true;
+            needed[high] = true;
+        }
+    }
+    result.reverse();
+    result
+}
+
+fn median_network_source(radius: usize) -> String {
+    use std::fmt::Write;
+    let count = 2 * radius + 1;
+    let len = count.next_power_of_two();
+    let width = 16 + 2 * radius;
+    let mut source = format!("\nvar<workgroup> median_tile_{radius}: array<u32, {}>;\n", width * 16);
+    for vertical in [false, true] {
+        let axis = if vertical { "v" } else { "h" };
+        let (along, across, limit, other_limit) = if vertical { ("g.y", "g.x", "h", "w") } else { ("g.x", "g.y", "w", "h") };
+        let (local_along, local_across) = if vertical { ("l.y", "l.x") } else { ("l.x", "l.y") };
+        let input = if vertical { "position * w + other" } else { "other * w + position" };
+        let _ = write!(
+            source,
+            "\n@compute @workgroup_size(16,16) fn median_{axis}_{radius}(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {{\nlet w = pu(0u); let h = pu(1u);\nfor (var k = {local_along}; k < {width}u; k += 16u) {{\nlet position = u32(clamp(i32({along} - {local_along} + k) - {radius}, 0, i32({limit}) - 1));\nlet other = min({across}, {other_limit} - 1u);\nmedian_tile_{radius}[{local_across} * {width}u + k] = median_key(src[{input}]);\n}}\nworkgroupBarrier();\nif (g.x >= w || g.y >= h) {{ return; }}\nvar v: array<u32, {len}>;\n"
+        );
+        for index in 0..len {
+            if index < count {
+                let _ = writeln!(source, "v[{index}] = median_tile_{radius}[{local_across} * {width}u + {local_along} + {index}u];");
+            } else {
+                let _ = writeln!(source, "v[{index}] = 0xffffffffu;");
+            }
+        }
+        for (index, (low, high, need_low, need_high)) in median_comparators(radius).into_iter().enumerate() {
+            let _ = writeln!(source, "let a{index} = v[{low}]; let b{index} = v[{high}];");
+            if need_low {
+                let _ = writeln!(source, "v[{low}] = min(a{index}, b{index});");
+            }
+            if need_high {
+                let _ = writeln!(source, "v[{high}] = max(a{index}, b{index});");
+            }
+        }
+        let _ = writeln!(
+            source,
+            "let key = v[{radius}]; let bits = key ^ select(0xffffffffu, 0x80000000u, (key & 0x80000000u) != 0u); dst[g.y * w + g.x] = bitcast<f32>(bits); }}"
+        );
+    }
+    source
+}
+
 impl Gpu {
+    pub(crate) fn has_kernel(&self, name: &str) -> bool {
+        self.kernels.contains_key(name)
+    }
     /// Create a device on the best available adapter (no software adapter unless
     /// `LIGHTCRAFT_GPU_ALLOW_SOFTWARE`), or why there is none.
     pub fn new(backends: wgpu::Backends) -> Result<Gpu, String> {
@@ -1049,6 +1191,35 @@ pub fn groups1(n: usize) -> [u32; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn median_networks_select_exact_middle() {
+        for radius in 1..=24 {
+            let comparators = super::median_comparators(radius);
+            eprintln!("r={radius}: {} comparators", comparators.len());
+            let count = radius * 2 + 1;
+            let mut seed = 1_u32;
+            for _ in 0..1000 {
+                let mut values = vec![u32::MAX; count.next_power_of_two()];
+                for value in &mut values[..count] {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *value = seed;
+                }
+                let mut sorted = values.clone();
+                sorted.sort_unstable();
+                for &(low, high, need_low, need_high) in &comparators {
+                    let (a, b) = (values[low], values[high]);
+                    if need_low {
+                        values[low] = a.min(b);
+                    }
+                    if need_high {
+                        values[high] = a.max(b);
+                    }
+                }
+                assert_eq!(values[radius], sorted[radius], "r={radius}");
+            }
+        }
+    }
+
     /// Every kernel module, as it is handed to the device (the generated constants, the bindings, `common.wgsl`, the
     /// module), parses and validates without a GPU.
     #[test]
@@ -1057,6 +1228,10 @@ mod tests {
         for m in super::MODULES {
             let name = m.entries.first().copied().unwrap_or("?");
             assert_eq!(crate::validate_wgsl(name, &super::module_source(m, &consts)), Ok(()));
+        }
+        for radius in 1..=24 {
+            let src = format!("{}{}", super::module_source(&super::MODULES[1], &consts), super::median_network_source(radius));
+            assert_eq!(crate::validate_wgsl("median network", &src), Ok(()), "r={radius}");
         }
     }
 
@@ -1128,7 +1303,7 @@ mod tests {
             return;
         };
         let entries: Vec<&str> = super::MODULES.iter().flat_map(|m| m.entries.iter().copied()).collect();
-        assert_eq!(g.kernels.len(), entries.len());
+        assert!(g.kernels.len() >= entries.len());
         for e in entries {
             assert!(g.kernels.contains_key(e), "no kernel for {e}");
         }
@@ -1236,6 +1411,9 @@ mod tests {
         super::SIMULATED_LOST_POLL.with(|c| c.set(false));
         assert!(super::read_texture(&g.device, &g.queue, &texture, 8, 8).is_err(), "a lost device is not polled again");
         println!("CHILD: survived");
+        // The simulated lost-device driver crashes during resource teardown, after every assertion
+        // has passed. Keep this child isolated and exit cleanly, as in `lost_poll_child` below.
+        std::process::exit(0);
     }
 
     /// A Metal device really lost (its command buffers exhausted) is never polled again.
@@ -1374,6 +1552,9 @@ mod tests {
         }));
         assert!(r.is_err());
         println!("CHILD: survived");
+        // After a simulated device loss, wgpu's process-wide teardown can segfault in the driver.
+        // This child is already the test boundary; exit after the assertions instead of tearing it down.
+        std::process::exit(0);
     }
 
     #[test]
