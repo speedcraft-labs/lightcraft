@@ -187,20 +187,21 @@ fn median_u16_sorted_rows(image: &Image<u16>, radius: usize) -> Image<u16> {
 }
 
 fn median_u16_sorted_line(src: &[u16], out: &mut [u16], radius: usize) {
-    let at = |i: isize| src[i.clamp(0, src.len() as isize - 1) as usize];
+    let at = |i: isize| i32::from(src[i.clamp(0, src.len() as isize - 1) as usize]);
     let r = radius as isize;
-    let mut window: Vec<u16> = (-r..=r).map(at).collect();
+    let mut window: Vec<i32> = (-r..=r).map(at).collect();
     window.sort_unstable();
     for (x, dst) in out.iter_mut().enumerate() {
-        *dst = window[radius];
+        *dst = window[radius] as u16;
         let old = at(x as isize - r);
         let new = at(x as isize + r + 1);
         if old != new {
-            let (mut i, mut j) = (0usize, 0usize);
+            let (mut i, mut j) = (0u32, 0u32);
             for &value in &window {
-                i += usize::from(value < old);
-                j += usize::from(value < new);
+                i += u32::from(value < old);
+                j += u32::from(value < new);
             }
+            let (i, j) = (i as usize, j as usize);
             if j > i {
                 window.copy_within(i + 1..j, i);
                 window[j - 1] = new;
