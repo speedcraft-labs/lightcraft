@@ -1,7 +1,7 @@
 name: Hosted CI
 on:
   push:
-    branches: [main, algo/ci, algo/rustgpu-blur]
+    branches: [main, algo/ci]
   workflow_dispatch:
 permissions:
   contents: read
