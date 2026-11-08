@@ -1604,6 +1604,14 @@ mod tests {
             lightcraft_raster::Image::from_fn(cpu_w, cpu_h, |x, y| ((x as u32 * 40_503 + y as u32 * 7_919 + (x * y) as u32 * 17) & 0xffff) as u16);
         let plane8 = Plane { width: cpu_w, height: cpu_h, data: image8.data.iter().map(|&v| f32::from(v)).collect() };
         let plane16 = Plane { width: cpu_w, height: cpu_h, data: image16.data.iter().map(|&v| f32::from(v)).collect() };
+        let cpu_meta = MedianBenchMeta {
+            cpu_model: &cpu_model,
+            kernel: &kernel,
+            logical_cores,
+            loadavg: loadavg.trim(),
+            isolated: &isolated,
+            head_rev: &head_rev,
+        };
         let src = gpu.upload(&input.data);
         let mut cx = Cx::new(gpu);
         eprintln!("median benchmark: {} ({:?})", gpu.info.name, gpu.info.backend);
@@ -1663,64 +1671,69 @@ mod tests {
                 hash_f32(&new)
             );
 
-            let old8 = local::median_hv(&plane8, r);
-            let new8 = lightcraft_raster::median::median_u8_hv(&image8, r);
-            assert_eq!(
-                old8.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                new8.data.iter().map(|&v| f32::from(v).to_bits()).collect::<Vec<_>>(),
-                "CPU u8 parity r={r}"
-            );
-            let (old8_ms, new8_ms) = paired_cpu_times(
-                || {
-                    std::hint::black_box(local::median_hv(&plane8, r));
-                },
-                || {
-                    std::hint::black_box(lightcraft_raster::median::median_u8_hv(&image8, r));
-                },
-            );
-            let ratios: Vec<f64> = new8_ms.iter().zip(old8_ms.iter()).map(|(n, o)| n / o).collect();
-            let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
-            eprintln!(
-                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u8\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
-                cpu_model,
-                kernel,
-                loadavg.trim(),
-                isolated,
-                head_rev,
-                old8_ms,
-                new8_ms,
-                hash_u8(&new8.data)
-            );
-
-            let old16 = local::median_hv(&plane16, r);
-            let new16 = lightcraft_raster::median::median_u16_hv(&image16, r);
-            assert_eq!(
-                old16.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                new16.data.iter().map(|&v| f32::from(v).to_bits()).collect::<Vec<_>>(),
-                "CPU u16 parity r={r}"
-            );
-            let (old16_ms, new16_ms) = paired_cpu_times(
-                || {
-                    std::hint::black_box(local::median_hv(&plane16, r));
-                },
-                || {
-                    std::hint::black_box(lightcraft_raster::median::median_u16_hv(&image16, r));
-                },
-            );
-            let ratios: Vec<f64> = new16_ms.iter().zip(old16_ms.iter()).map(|(n, o)| n / o).collect();
-            let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
-            eprintln!(
-                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u16\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
-                cpu_model,
-                kernel,
-                loadavg.trim(),
-                isolated,
-                head_rev,
-                old16_ms,
-                new16_ms,
-                hash_u16(&new16.data)
-            );
+            bench_cpu_integer("u8", &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
+            bench_cpu_integer("u16", &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
         }
+        for r in [48, 96] {
+            bench_cpu_integer("u8", &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
+            bench_cpu_integer("u16", &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
+        }
+    }
+
+    struct MedianBenchMeta<'a> {
+        cpu_model: &'a str,
+        kernel: &'a str,
+        logical_cores: usize,
+        loadavg: &'a str,
+        isolated: &'a str,
+        head_rev: &'a str,
+    }
+
+    fn bench_cpu_integer<T, Filter, Hash>(
+        dtype: &str,
+        input: &lightcraft_raster::Image<T>,
+        baseline_input: &Plane,
+        radius: usize,
+        meta: &MedianBenchMeta<'_>,
+        filter: Filter,
+        hash: Hash,
+    ) where
+        T: Copy,
+        f32: From<T>,
+        Filter: Fn(&lightcraft_raster::Image<T>, usize) -> lightcraft_raster::Image<T> + Copy,
+        Hash: Fn(&[T]) -> u64,
+    {
+        let old = local::median_hv(baseline_input, radius);
+        let new = filter(input, radius);
+        assert_eq!(
+            old.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            new.data.iter().map(|&v| f32::from(v).to_bits()).collect::<Vec<_>>(),
+            "CPU {dtype} parity r={radius}"
+        );
+        let (baseline_ms, candidate_ms) = paired_cpu_times(
+            || {
+                std::hint::black_box(local::median_hv(baseline_input, radius));
+            },
+            || {
+                std::hint::black_box(filter(input, radius));
+            },
+        );
+        let ratios: Vec<f64> = candidate_ms.iter().zip(baseline_ms.iter()).map(|(n, o)| n / o).collect();
+        let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
+        eprintln!(
+            "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"{dtype}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{},\"height\":{},\"radius\":{radius},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+            meta.cpu_model,
+            meta.kernel,
+            meta.logical_cores,
+            meta.loadavg,
+            meta.isolated,
+            meta.head_rev,
+            input.width,
+            input.height,
+            baseline_ms,
+            candidate_ms,
+            hash(&new.data)
+        );
     }
 
     fn paired_cpu_times(mut baseline: impl FnMut(), mut candidate: impl FnMut()) -> ([f64; 10], [f64; 10]) {

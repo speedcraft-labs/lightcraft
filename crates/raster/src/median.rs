@@ -20,9 +20,12 @@ pub fn median_u16_hv(image: &Image<u16>, radius: usize) -> Image<u16> {
     if radius == 0 || image.width == 0 || image.height == 0 {
         return image.clone();
     }
-    let horizontal = median_u16_rows(image, radius);
+    // For short windows, moving the already-sorted taps is cheaper than maintaining a 16-bit
+    // histogram. The histogram path keeps larger radii independent of the window width.
+    let horizontal = if radius <= 32 { median_u16_sorted_rows(image, radius) } else { median_u16_rows(image, radius) };
     let vertical_input = transpose(&horizontal);
-    transpose(&median_u16_rows(&vertical_input, radius))
+    let vertical = if radius <= 32 { median_u16_sorted_rows(&vertical_input, radius) } else { median_u16_rows(&vertical_input, radius) };
+    transpose(&vertical)
 }
 
 fn median_u8_rows(image: &Image<u8>, radius: usize) -> Image<u8> {
@@ -167,6 +170,46 @@ fn median_u16_rows(image: &Image<u16>, radius: usize) -> Image<u16> {
         }
     }
     out
+}
+
+fn median_u16_sorted_rows(image: &Image<u16>, radius: usize) -> Image<u16> {
+    let mut out = Image::new(image.width, image.height);
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.data.par_chunks_mut(image.width).zip(image.data.par_chunks(image.width)).for_each(|(dst, src)| median_u16_sorted_line(src, dst, radius));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (dst, src) in out.data.chunks_mut(image.width).zip(image.data.chunks(image.width)) {
+        median_u16_sorted_line(src, dst, radius);
+    }
+    out
+}
+
+fn median_u16_sorted_line(src: &[u16], out: &mut [u16], radius: usize) {
+    let at = |i: isize| src[i.clamp(0, src.len() as isize - 1) as usize];
+    let r = radius as isize;
+    let mut window: Vec<u16> = (-r..=r).map(at).collect();
+    window.sort_unstable();
+    for (x, dst) in out.iter_mut().enumerate() {
+        *dst = window[radius];
+        let old = at(x as isize - r);
+        let new = at(x as isize + r + 1);
+        if old != new {
+            let (mut i, mut j) = (0usize, 0usize);
+            for &value in &window {
+                i += usize::from(value < old);
+                j += usize::from(value < new);
+            }
+            if j > i {
+                window.copy_within(i + 1..j, i);
+                window[j - 1] = new;
+            } else {
+                window.copy_within(j..i, j + 1);
+                window[j] = new;
+            }
+        }
+    }
 }
 
 fn transpose<T: Copy + Default>(image: &Image<T>) -> Image<T> {
@@ -434,7 +477,7 @@ mod tests {
             let b = Image::from_fn(w, h, |x, y| {
                 (x as u32).wrapping_mul(2_654_435_761).wrapping_add((y as u32).wrapping_mul(2_246_822_519)).wrapping_add((x * y) as u32) as u16
             });
-            for radius in [0, 1, 3, 24] {
+            for radius in [0, 1, 3, 24, 33, 64] {
                 assert_eq!(median_u8_hv(&a, radius), oracle(&a, radius), "u8 {w}x{h} r={radius}");
                 assert_eq!(median_u16_hv(&b, radius), oracle(&b, radius), "u16 {w}x{h} r={radius}");
             }
@@ -455,7 +498,7 @@ mod tests {
         let Ok(decoded16) = decoded16 else { return };
         let image16 = decoded16.to_luma16();
         let b = Image { width: image16.width() as usize, height: image16.height() as usize, data: image16.into_raw() };
-        for radius in [1, 3, 9, 24] {
+        for radius in [1, 3, 9, 24, 33] {
             assert_eq!(median_u8_hv(&a, radius), oracle(&a, radius), "8-bit PNGsuite radius={radius}");
             assert_eq!(median_u16_hv(&b, radius), oracle(&b, radius), "16-bit PNGsuite radius={radius}");
         }
