@@ -1658,7 +1658,7 @@ mod tests {
             let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
             std::hint::black_box(cpu);
             eprintln!(
-                "{{\"kind\":\"median-paired\",\"gpu\":\"{}\",\"backend\":\"{:?}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"870c5e22\",\"head_rev\":\"{}\",\"width\":{w},\"height\":{h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"cpu_ms\":{cpu_ms:.3},\"output_hash\":\"{:016x}\"}}",
+                "{{\"kind\":\"median-paired\",\"input\":\"synthetic-pattern\",\"input_kind\":\"synthetic\",\"gpu\":\"{}\",\"backend\":\"{:?}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"870c5e22\",\"head_rev\":\"{}\",\"width\":{w},\"height\":{h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"cpu_ms\":{cpu_ms:.3},\"output_hash\":\"{:016x}\"}}",
                 gpu.info.name,
                 gpu.info.backend,
                 cpu_model,
@@ -1671,12 +1671,47 @@ mod tests {
                 hash_f32(&new)
             );
 
-            bench_cpu_integer("u8", &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
-            bench_cpu_integer("u16", &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
+            bench_cpu_integer(("u8", "synthetic-pattern"), &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
+            bench_cpu_integer(("u16", "synthetic-pattern"), &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
         }
         for r in [48, 96] {
-            bench_cpu_integer("u8", &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
-            bench_cpu_integer("u16", &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
+            bench_cpu_integer(("u8", "synthetic-pattern"), &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
+            bench_cpu_integer(("u16", "synthetic-pattern"), &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
+        }
+
+        if let Some(root) = std::env::var_os("ARTCRAFT_HYPER_ROOT").map(std::path::PathBuf::from) {
+            let corpus8 = decode_corpus_gray(&root.join("corpus/psd-tools/gray1.psd"));
+            assert_eq!(corpus8.1, 8, "corpus u8 benchmark source bit depth");
+            let image8 = quantize_corpus_u8(&corpus8.0);
+            let plane8 = plane_from_u8(&image8);
+            for r in [2, 8, 24] {
+                bench_gpu_corpus(gpu, &cpu_meta, &corpus8.0, r, "corpus/psd-tools/gray1.psd");
+                bench_cpu_integer(
+                    ("u8", "corpus/psd-tools/gray1.psd quantized to u8"),
+                    &image8,
+                    &plane8,
+                    r,
+                    &cpu_meta,
+                    lightcraft_raster::median::median_u8_hv,
+                    hash_u8,
+                );
+            }
+
+            let corpus16 = decode_corpus_gray(&root.join("corpus/psd-tools/adjustments/threshold_16bits_grayscale.psd"));
+            assert_eq!(corpus16.1, 16, "corpus u16 benchmark source bit depth");
+            let image16 = quantize_corpus_u16(&corpus16.0);
+            let plane16 = plane_from_u16(&image16);
+            for r in [2, 8, 24] {
+                bench_cpu_integer(
+                    ("u16", "corpus/psd-tools/adjustments/threshold_16bits_grayscale.psd quantized to u16"),
+                    &image16,
+                    &plane16,
+                    r,
+                    &cpu_meta,
+                    lightcraft_raster::median::median_u16_hv,
+                    hash_u16,
+                );
+            }
         }
     }
 
@@ -1689,8 +1724,99 @@ mod tests {
         head_rev: &'a str,
     }
 
+    fn decode_corpus_gray(path: &std::path::Path) -> (Plane, u8) {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read corpus image {}: {e}", path.display()));
+        let decoded = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions::default())
+            .unwrap_or_else(|e| panic!("decode corpus image {}: {e}", path.display()));
+        assert!(decoded.grayscale, "{} must be a grayscale corpus image", path.display());
+        let plane =
+            Plane { width: decoded.width as usize, height: decoded.height as usize, data: decoded.image.data.iter().map(|pixel| pixel[0]).collect() };
+        (plane, decoded.bit_depth)
+    }
+
+    fn quantize_corpus_u8(plane: &Plane) -> lightcraft_raster::Image<u8> {
+        lightcraft_raster::Image {
+            width: plane.width,
+            height: plane.height,
+            data: plane.data.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
+        }
+    }
+
+    fn quantize_corpus_u16(plane: &Plane) -> lightcraft_raster::Image<u16> {
+        lightcraft_raster::Image {
+            width: plane.width,
+            height: plane.height,
+            data: plane.data.iter().map(|v| (v.clamp(0.0, 1.0) * 65_535.0).round() as u16).collect(),
+        }
+    }
+
+    fn plane_from_u8(image: &lightcraft_raster::Image<u8>) -> Plane {
+        Plane { width: image.width, height: image.height, data: image.data.iter().map(|&v| f32::from(v)).collect() }
+    }
+
+    fn plane_from_u16(image: &lightcraft_raster::Image<u16>) -> Plane {
+        Plane { width: image.width, height: image.height, data: image.data.iter().map(|&v| f32::from(v)).collect() }
+    }
+
+    fn bench_gpu_corpus(gpu: &crate::ctx::Gpu, meta: &MedianBenchMeta<'_>, input: &Plane, radius: usize, label: &str) {
+        let (w, h) = (input.width, input.height);
+        let src = gpu.upload(&input.data);
+        let mut cx = Cx::new(gpu);
+        let params = [w as u32, h as u32, 1, radius as u32];
+        let groups = groups2(w, h, [16, 16]);
+        let old_tmp = gpu.buffer(w * h);
+        let old_out = gpu.buffer(w * h);
+        let new_tmp = gpu.buffer(w * h);
+        let new_out = gpu.buffer(w * h);
+        let (new_horizontal, new_vertical) = crate::ctx::MEDIAN_NETWORKS[radius - 1];
+        let mut old_ms = [0.0f64; 10];
+        let mut new_ms = [0.0f64; 10];
+        cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
+        cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
+        cx.sync();
+        cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
+        cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
+        cx.sync();
+        for i in 0..10 {
+            for candidate_first in [i % 2 == 1, i % 2 == 0] {
+                cx.sync();
+                let start = std::time::Instant::now();
+                if candidate_first {
+                    cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
+                    cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
+                    cx.sync();
+                    new_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
+                } else {
+                    cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
+                    cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
+                    cx.sync();
+                    old_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
+        }
+        let old: Vec<f32> = cx.read(&old_out, w * h);
+        let new: Vec<f32> = cx.read(&new_out, w * h);
+        assert_eq!(old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{label} r={radius}");
+        let ratios: Vec<f64> = new_ms.iter().zip(old_ms.iter()).map(|(n, o)| n / o).collect();
+        let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
+        eprintln!(
+            "{{\"kind\":\"median-paired\",\"input\":\"{label}\",\"input_kind\":\"corpus\",\"gpu\":\"{}\",\"backend\":\"{:?}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"870c5e22\",\"head_rev\":\"{}\",\"width\":{w},\"height\":{h},\"radius\":{radius},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+            gpu.info.name,
+            gpu.info.backend,
+            meta.cpu_model,
+            meta.kernel,
+            meta.logical_cores,
+            meta.loadavg,
+            meta.isolated,
+            meta.head_rev,
+            old_ms,
+            new_ms,
+            hash_f32(&new)
+        );
+    }
+
     fn bench_cpu_integer<T, Filter, Hash>(
-        dtype: &str,
+        (dtype, input_label): (&str, &str),
         input: &lightcraft_raster::Image<T>,
         baseline_input: &Plane,
         radius: usize,
@@ -1721,7 +1847,8 @@ mod tests {
         let ratios: Vec<f64> = candidate_ms.iter().zip(baseline_ms.iter()).map(|(n, o)| n / o).collect();
         let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
         eprintln!(
-            "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"{dtype}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{},\"height\":{},\"radius\":{radius},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+            "{{\"kind\":\"median-cpu-paired\",\"input\":\"{input_label}\",\"input_kind\":\"{}\",\"dtype\":\"{dtype}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{},\"height\":{},\"radius\":{radius},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+            if input_label.starts_with("corpus/") { "corpus" } else { "synthetic" },
             meta.cpu_model,
             meta.kernel,
             meta.logical_cores,

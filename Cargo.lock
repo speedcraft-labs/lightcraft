@@ -3830,6 +3830,7 @@ version = "0.18.0"
 dependencies = [
  "bytemuck",
  "image",
+ "lightcraft-codecs",
  "lightcraft-color",
  "lightcraft-denoise",
  "lightcraft-develop",
