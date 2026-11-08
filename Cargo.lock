@@ -4063,7 +4063,6 @@ dependencies = [
  "lightcraft-slideshow",
  "lightcraft-testkit",
  "log",
- "pollster 1.0.1",
  "serde",
  "serde_json",
  "toml",

@@ -231,19 +231,38 @@ pub fn shutting_down() -> bool {
     }
 }
 
-/// Wait up to `timeout` for the GPU work in flight on every thread to end. `true`: none is left,
-/// and after [`begin_shutdown`] none can start, so the process may end; `false`: the deadline
-/// passed with a render (or a device being created) still inside the driver.
+/// Wait up to `timeout` for GPU work in flight on every thread to end, then drain submitted device
+/// work. Call after [`begin_shutdown`]. `true`: no API call is inside the driver and submitted work
+/// is complete; `false`: the deadline passed while a render, device creation, or queue submission
+/// was still active.
 pub fn wait_idle(timeout: std::time::Duration) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        exit::wait_idle(timeout)
+        if !drain_idle(timeout) {
+            return false;
+        }
+        true
     }
     #[cfg(target_arch = "wasm32")]
     {
         let _ = timeout;
         true
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn drain_idle(timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    if !exit::wait_idle(timeout) {
+        return false;
+    }
+    if let Some(gpu) = existing_device() {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if gpu.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(remaining) }).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Why GPU compute that has a device of its own (denoise, faces) is switched off by the user's settings, or `None`: the
@@ -335,6 +354,17 @@ pub(crate) fn existing_device() -> Option<&'static ctx::Gpu> {
     GPU.get().and_then(|g| g.as_ref().ok())
 }
 
+/// Helpers for downstream GPU integration tests. Keeps test fixtures on the application's shared
+/// device instead of creating competing wgpu devices in the same process.
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub mod test_support {
+    /// Clone the shared renderer handles after the adapter is available.
+    pub fn device_handles() -> Option<(super::wgpu::Device, super::wgpu::Queue)> {
+        super::device().map(|gpu| (gpu.device.clone(), gpu.queue.clone()))
+    }
+}
+
 /// Create the device and compile the kernels on a background thread now (once the window is up),
 /// so the first render doesn't wait ~0.3–0.4 s for it and the UI thread never does. Does nothing
 /// while GPU rendering is turned off. Repeated calls start one thread at most.
@@ -346,6 +376,10 @@ pub fn warm_up() {
             return;
         }
         let spawned = std::thread::Builder::new().name("lc-gpu-init".into()).spawn(|| {
+            // Keep the shutdown gate until this worker is fully done, including its post-init
+            // bookkeeping and thread exit. Tracking only `device()` allowed process teardown to
+            // overlap the last few instructions on this thread (issue #620).
+            let Some(_warmup) = exit::enter() else { return };
             loop {
                 let _ = device();
                 if GPU.get().is_some() || shutting_down() || env_disabled() {

@@ -470,17 +470,30 @@ fn request(app: &mut crate::LightcraftApp) {
 
 /// Draws GPU-resident renders under one fixed id, and reads them back from the test's device.
 #[cfg(not(target_arch = "wasm32"))]
-struct TestScreen(lightcraft_engine::gpu::wgpu::Device, lightcraft_engine::gpu::wgpu::Queue, std::sync::Arc<std::sync::Mutex<Vec<egui::TextureId>>>);
+struct TestScreen {
+    device: lightcraft_engine::gpu::wgpu::Device,
+    queue: lightcraft_engine::gpu::wgpu::Queue,
+    freed: std::sync::Arc<std::sync::Mutex<Vec<egui::TextureId>>>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for TestScreen {
+    fn drop(&mut self) {
+        // Finish writes and readbacks before dropping textures on the shared renderer device.
+        let _ = self
+            .device
+            .poll(lightcraft_engine::gpu::wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(120)) });
+    }
+}
 #[cfg(not(target_arch = "wasm32"))]
 impl ScreenTextures for TestScreen {
     fn show(&mut self, _: &lightcraft_engine::media::ScreenFrame, _: Option<egui::TextureId>) -> Option<egui::TextureId> {
         Some(egui::TextureId::User(7))
     }
     fn free(&mut self, id: egui::TextureId) {
-        self.2.lock().unwrap().push(id);
+        self.freed.lock().unwrap().push(id);
     }
     fn read(&self, frame: &lightcraft_engine::media::ScreenFrame) -> Option<egui::ColorImage> {
-        let img = lightcraft_engine::gpu::read_texture(&self.0, &self.1, &frame.texture, frame.width, frame.height).ok()?;
+        let img = lightcraft_engine::gpu::read_texture(&self.device, &self.queue, &frame.texture, frame.width, frame.height).ok()?;
         Some(color_image(&img))
     }
 }
@@ -496,15 +509,10 @@ fn gpu_drawn_fixture(
     freed: std::sync::Arc<std::sync::Mutex<Vec<egui::TextureId>>>,
 ) -> Option<(crate::LightcraftApp, std::rc::Rc<std::cell::RefCell<Work>>, egui::Context, lightcraft_engine::media::ScreenFrame)> {
     use lightcraft_engine::gpu::wgpu;
-    let device = (|| {
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = lightcraft_engine::gpu::backend::window_backends();
-        desc.backend_options = lightcraft_engine::gpu::backend::backend_options();
-        let instance = wgpu::Instance::new(desc);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("test window"), ..Default::default() })).ok()
-    })();
-    let (device, queue) = device?;
+    if !lightcraft_engine::gpu::available() {
+        return None;
+    }
+    let (device, queue) = lightcraft_engine::gpu::test_support::device_handles()?;
     let (w, h) = (5usize, 3usize);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -524,7 +532,7 @@ fn gpu_drawn_fixture(
         wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
     );
     let (mut app, work, ctx) = fixture();
-    app.renderer.set_screen_textures(Box::new(TestScreen(device, queue, freed)));
+    app.renderer.set_screen_textures(Box::new(TestScreen { device, queue, freed }));
     Some((app, work, ctx, lightcraft_engine::media::ScreenFrame { texture, width: w, height: h }))
 }
 
@@ -534,6 +542,7 @@ fn gpu_drawn_fixture(
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_headless_screenshot_reads_back_a_view_drawn_from_the_gpu() {
+    let _device_turn = crate::test_gpu::device_turn();
     let Some((mut app, work, ctx, frame)) = gpu_drawn_fixture(Default::default()) else {
         lightcraft_testkit::skip!(Gpu, "no GPU adapter");
         return;
@@ -561,6 +570,7 @@ fn a_headless_screenshot_reads_back_a_view_drawn_from_the_gpu() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn releasing_a_slot_frees_its_gpu_texture() {
+    let _device_turn = crate::test_gpu::device_turn();
     let freed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let Some((mut app, work, ctx, frame)) = gpu_drawn_fixture(freed.clone()) else {
         lightcraft_testkit::skip!(Gpu, "no GPU adapter");

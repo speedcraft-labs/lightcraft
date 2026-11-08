@@ -317,14 +317,15 @@ pub struct Renderer {
     /// Since when nothing has been pending, and whether the GPU pool was trimmed since.
     #[cfg(not(target_arch = "wasm32"))]
     idle: Option<(std::time::Instant, bool)>,
-    /// Draws GPU-resident renders; with it, interactive drafts of views stay on the GPU.
-    screen: Option<Box<dyn ScreenTextures>>,
     /// The texture id each view slot shows GPU-resident renders under (one per slot, reused).
     natives: HashMap<Slot, egui::TextureId>,
     /// The GPU-resident render each of those shows, kept with [`Self::keep_pixels`]: a headless
     /// screenshot reads it back ([`Self::cpu_textures`]) instead of finding no pixels (a white
     /// photo, review of PR #1065).
     native_frames: HashMap<Slot, lightcraft_engine::media::ScreenFrame>,
+    /// Draws GPU-resident renders; with it, interactive drafts of views stay on the GPU. Keep it
+    /// after `native_frames` so its device handles outlive the textures that use them.
+    screen: Option<Box<dyn ScreenTextures>>,
 }
 
 /// After this long without renders the GPU renderer's pool of recycled buffers is freed.
