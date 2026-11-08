@@ -12,6 +12,7 @@
 
 pub mod blur;
 pub mod histogram;
+pub mod median;
 pub mod morph;
 pub mod resample;
 pub mod sample;

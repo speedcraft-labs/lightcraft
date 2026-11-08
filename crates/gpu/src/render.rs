@@ -1482,6 +1482,7 @@ mod tests {
             return;
         };
         let _scope = crate::ctx::RenderScope::new(gpu);
+        let mut cx = Cx::new(gpu);
         let values = [0xffc00012, 0xff800000, 0xbf800000, 0x80000000, 0, 0x3f800000, 0x7f800000, 0x7fc00012];
         for (horizontal, vertical) in crate::ctx::MEDIAN_NETWORKS {
             assert!(gpu.has_kernel(horizontal) && gpu.has_kernel(vertical), "network unavailable: {horizontal}, {vertical}");
@@ -1491,7 +1492,6 @@ mod tests {
             let radii: Vec<_> = if (w, h) == (17, 19) { (1..=24).collect() } else { vec![1, 2, 8, 24] };
             for r in radii {
                 let expected = lightcraft_pipeline::local::median_hv(&input, r);
-                let mut cx = Cx::new(gpu);
                 let src = gpu.upload(&input.data);
                 let out = median_hv(&mut cx, &src, w, h, r);
                 let actual: Vec<f32> = cx.read(&out, w * h);
@@ -1502,6 +1502,34 @@ mod tests {
                 );
             }
         }
+        if let Some(root) = std::env::var_os("ARTCRAFT_HYPER_ROOT").map(std::path::PathBuf::from) {
+            let corpus = root.join("corpus/pngsuite");
+            let decoded8 = image::open(corpus.join("basn0g08.png"));
+            assert!(decoded8.is_ok(), "8-bit PNGsuite corpus image must decode: {decoded8:?}");
+            let Ok(decoded8) = decoded8 else { return };
+            let pixels8 = decoded8.to_luma8();
+            let (w, h) = (pixels8.width() as usize, pixels8.height() as usize);
+            let plane8 = Plane::from_fn(w, h, |x, y| f32::from(pixels8.get_pixel(x as u32, y as u32).0[0]));
+            let decoded16 = image::open(corpus.join("basn0g16.png"));
+            assert!(decoded16.is_ok(), "16-bit PNGsuite corpus image must decode: {decoded16:?}");
+            let Ok(decoded16) = decoded16 else { return };
+            let pixels16 = decoded16.to_luma16();
+            let (w16, h16) = (pixels16.width() as usize, pixels16.height() as usize);
+            let plane16 = Plane::from_fn(w16, h16, |x, y| f32::from(pixels16.get_pixel(x as u32, y as u32).0[0]));
+            for (plane, w, h, name) in [(&plane8, w, h, "8-bit"), (&plane16, w16, h16, "16-bit")] {
+                for r in [1, 3, 9, 24] {
+                    let expected = lightcraft_pipeline::local::median_hv(plane, r);
+                    let src = gpu.upload(&plane.data);
+                    let out = median_hv(&mut cx, &src, w, h, r);
+                    let actual: Vec<f32> = cx.read(&out, w * h);
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{name} PNGsuite r={r}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1510,22 +1538,110 @@ mod tests {
         let Some(gpu) = crate::device() else { return };
         let _scope = crate::ctx::RenderScope::new(gpu);
         let (w, h) = (6000, 4000);
+        let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("model name\t:")).map(|l| l.trim_start_matches("model name\t: ").to_owned()))
+            .unwrap_or_else(|| "unknown".into());
+        let kernel = std::process::Command::new("uname")
+            .arg("-sr")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let head_rev = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        let logical_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        let isolated = std::env::var("CRAFT_BENCH_ISOLATED").unwrap_or_default();
         let input = Plane::from_fn(w, h, |x, y| ((x * 37 + y * 73) % 256) as f32 / 255.0);
         let src = gpu.upload(&input.data);
+        let mut cx = Cx::new(gpu);
         eprintln!("median benchmark: {} ({:?})", gpu.info.name, gpu.info.backend);
         for r in [2, 8, 24] {
-            let start = std::time::Instant::now();
-            let result = lightcraft_pipeline::local::median_hv(&input, r);
-            eprintln!("cpu r={r}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
-            std::hint::black_box(result);
-            let mut cx = Cx::new(gpu);
+            let params = [w as u32, h as u32, 1, r as u32];
+            let groups = groups2(w, h, [16, 16]);
+            let old_tmp = gpu.buffer(w * h);
+            let old_out = gpu.buffer(w * h);
+            let new_tmp = gpu.buffer(w * h);
+            let new_out = gpu.buffer(w * h);
+            let (new_horizontal, new_vertical) = crate::ctx::MEDIAN_NETWORKS[r - 1];
+            let mut old_ms = [0.0f64; 10];
+            let mut new_ms = [0.0f64; 10];
+            cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
+            cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
             cx.sync();
-            let start = std::time::Instant::now();
-            let result = median_hv(&mut cx, &src, w, h, r);
+            cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
+            cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
             cx.sync();
-            eprintln!("gpu r={r}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
-            std::hint::black_box(result);
+            for i in 0..10 {
+                for candidate_first in [i % 2 == 1, i % 2 == 0] {
+                    cx.sync();
+                    let start = std::time::Instant::now();
+                    if candidate_first {
+                        cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
+                        cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
+                        cx.sync();
+                        new_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
+                    } else {
+                        cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
+                        cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
+                        cx.sync();
+                        old_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                }
+            }
+            let old: Vec<f32> = cx.read(&old_out, w * h);
+            let new: Vec<f32> = cx.read(&new_out, w * h);
+            let new: Vec<f32> = cx.read(&new, w * h);
+            assert_eq!(old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "r={r}");
+            let ratios: Vec<f64> = new_ms.iter().zip(old_ms.iter()).map(|(n, o)| n / o).collect();
+            let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
+            let cpu_start = std::time::Instant::now();
+            let cpu = lightcraft_pipeline::local::median_hv(&input, r);
+            let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(cpu);
+            eprintln!(
+                "{{\"kind\":\"median-paired\",\"gpu\":\"{}\",\"backend\":\"{:?}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"870c5e22\",\"head_rev\":\"{}\",\"width\":{w},\"height\":{h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"cpu_ms\":{cpu_ms:.3},\"output_hash\":\"{:016x}\"}}",
+                gpu.info.name,
+                gpu.info.backend,
+                cpu_model,
+                kernel,
+                loadavg.trim(),
+                isolated,
+                head_rev,
+                old_ms,
+                new_ms,
+                hash_f32(&new)
+            );
         }
+    }
+
+    fn hash_f32(values: &[f32]) -> u64 {
+        values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(v.to_bits())).wrapping_mul(0x100000001b3))
+    }
+
+    fn bootstrap_median_ci(ratios: &[f64]) -> (f64, f64, f64) {
+        let mut rng = 0x29f1_a5c3u32;
+        let mut sample = [0.0f64; 10];
+        let mut estimates = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            for value in &mut sample {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                *value = ratios[rng as usize % ratios.len()];
+            }
+            sample.sort_by(f64::total_cmp);
+            estimates.push((sample[4] + sample[5]) * 0.5);
+        }
+        estimates.sort_by(f64::total_cmp);
+        let mut ordered = ratios.to_vec();
+        ordered.sort_by(f64::total_cmp);
+        ((ordered[4] + ordered[5]) * 0.5, estimates[250], estimates[9_749])
     }
 
     #[test]

@@ -3829,6 +3829,7 @@ name = "lightcraft-gpu"
 version = "0.18.0"
 dependencies = [
  "bytemuck",
+ "image",
  "lightcraft-color",
  "lightcraft-denoise",
  "lightcraft-develop",
@@ -3945,6 +3946,7 @@ name = "lightcraft-raster"
 version = "0.18.0"
 dependencies = [
  "craft-blur",
+ "image",
  "libc",
  "lightcraft-color",
  "lightcraft-geom",
