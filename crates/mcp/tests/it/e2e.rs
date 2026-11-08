@@ -19,6 +19,29 @@ fn session(server: &mut Server, msgs: &[Value]) -> Vec<Value> {
     String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
+/// A one-connection fake desktop host. Its worker owns the headless render session, so join it
+/// before the test process exits and tears down wgpu's process-wide device.
+struct FakeApp {
+    addr: String,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeApp {
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
+impl Drop for FakeApp {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            // If a test failed before Remote connected, wake accept so the worker can still exit.
+            let _ = std::net::TcpStream::connect(&self.addr);
+            let _ = worker.join();
+        }
+    }
+}
+
 fn call(id: u64, name: &str, args: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}})
 }
@@ -93,8 +116,8 @@ fn file_writers_advertise_destructive_effects() {
         assert_eq!(preview["annotations"]["readOnlyHint"], true);
         assert_eq!(preview["annotations"]["destructiveHint"], false);
     }
-    let addr = fake_app();
-    let mut server = Server::new(Box::new(Remote::connect(&addr).unwrap()));
+    let fake = fake_app();
+    let mut server = Server::new(Box::new(Remote::connect(fake.addr()).unwrap()));
     let replies = session(&mut server, &[json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})]);
     let tools = replies[0]["result"]["tools"].as_array().unwrap();
     let screenshot = tools.iter().find(|t| t["name"] == "screenshot").unwrap();
@@ -142,33 +165,32 @@ fn import_render_export_real_file() {
 
 /// A stand-in for the desktop app's control server: JSON lines over TCP, answered by a headless
 /// backend (the real app answers the same methods from its UI thread).
-fn fake_app() -> String {
+fn fake_app() -> FakeApp {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
         let mut backend = Headless::demo();
-        for stream in listener.incoming().flatten() {
-            let mut out = stream.try_clone().unwrap();
-            for line in BufReader::new(stream).lines() {
-                let Ok(line) = line else { break };
-                let msg: Value = serde_json::from_str(&line).unwrap();
-                let reply = match backend.call(msg["method"].as_str().unwrap(), msg["params"].clone()) {
-                    Ok(v) => json!({"id": msg["id"], "ok": true, "result": v}),
-                    Err(e) => json!({"id": msg["id"], "ok": false, "error": e}),
-                };
-                if writeln!(out, "{reply}").is_err() {
-                    break;
-                }
+        let mut out = stream.try_clone().unwrap();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let reply = match backend.call(msg["method"].as_str().unwrap(), msg["params"].clone()) {
+                Ok(v) => json!({"id": msg["id"], "ok": true, "result": v}),
+                Err(e) => json!({"id": msg["id"], "ok": false, "error": e}),
+            };
+            if writeln!(out, "{reply}").is_err() {
+                break;
             }
         }
     });
-    addr
+    FakeApp { addr, worker: Some(worker) }
 }
 
 #[test]
 fn remote_set_exposure_and_render() {
-    let addr = fake_app();
-    let remote = Remote::connect(&addr).unwrap();
+    let fake = fake_app();
+    let remote = Remote::connect(fake.addr()).unwrap();
     assert!(remote.has_ui());
     let mut server = Server::new(Box::new(remote));
     exposure_roundtrip(&mut server);
@@ -248,8 +270,10 @@ impl Backend for HoldAfterFirst {
 
 type Rx = std::sync::mpsc::Receiver<Value>;
 
-fn next_msg(rx: &Rx) -> Value {
-    rx.recv_timeout(Duration::from_secs(30)).expect("MCP reply/progress")
+fn next_msg(rx: &Rx, waiting_for: &str) -> Value {
+    // This test writes eight real 1200×800 images twice; on shared CI CPUs the final reply can
+    // take longer than the 30 seconds allowed for a small synthetic fixture.
+    rx.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|error| panic!("{waiting_for}: MCP reply/progress timed out: {error}"))
 }
 
 fn assert_query_photos(photos: &[Value]) {
@@ -269,7 +293,7 @@ fn run_complete_export(send: &mut impl Write, rx: &Rx, hold: &AtomicBool, ids: &
     writeln!(send, "{request}").unwrap();
     let (mut last, mut notes, mut asked, mut answered) = (-1.0, 0, false, false);
     loop {
-        let value = next_msg(rx);
+        let value = next_msg(rx, "complete export progress or reply");
         if value["method"] == "notifications/progress" {
             assert_eq!(value["params"]["progressToken"], "photos");
             let progress = value["params"]["progress"].as_f64().unwrap();
@@ -303,7 +327,7 @@ fn run_cancelled_export(send: &mut impl Write, rx: &Rx, hold: &AtomicBool, ids: 
     request["params"]["_meta"] = json!({"progressToken":44});
     writeln!(send, "{request}").unwrap();
     loop {
-        let value = next_msg(rx);
+        let value = next_msg(rx, "cancelled export progress");
         assert_ne!(value["id"], 4, "must be cancellable before completion: {value}");
         assert_eq!(value["params"]["progressToken"], 44, "{value}");
         if value["params"]["progress"].as_f64().unwrap() > 0.0 {
@@ -313,7 +337,7 @@ fn run_cancelled_export(send: &mut impl Write, rx: &Rx, hold: &AtomicBool, ids: 
     writeln!(send, "{}", json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}})).unwrap();
     writeln!(send, "{}", call(5, "doc_inspect", json!({}))).unwrap();
     loop {
-        let value = next_msg(rx);
+        let value = next_msg(rx, "request after cancel");
         if value["method"] == "notifications/progress" {
             continue;
         }
@@ -372,7 +396,7 @@ fn export_progress_and_cancel() {
         }
     });
     writeln!(send, "{}", call(1, "query_photos", json!({"limit":8}))).unwrap();
-    let query = next_msg(&rx);
+    let query = next_msg(&rx, "photo query reply");
     let photos = query["result"]["structuredContent"]["photos"].as_array().unwrap();
     assert_query_photos(photos);
     let ids: Vec<_> = photos.iter().map(|p| p["id"].clone()).collect();

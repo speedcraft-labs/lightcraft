@@ -2,6 +2,7 @@
 //! the pool limit, and trimming frees them. Skips when no GPU adapter exists.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lightcraft_develop::DevelopSettings;
 use lightcraft_pipeline::{RenderRequest, SourceInfo, StageCache};
@@ -38,4 +39,6 @@ fn stages_are_counted_and_the_pool_is_bounded_and_trimmed() {
     let m = lightcraft_gpu::memory();
     assert_eq!(m.pooled, 0);
     assert!(m.allocated < before, "trimming frees the pooled buffers: {} → {}", before, m.allocated);
+    lightcraft_gpu::begin_shutdown();
+    assert!(lightcraft_gpu::wait_idle(Duration::from_secs(60)), "drain and destroy the test device before process exit");
 }

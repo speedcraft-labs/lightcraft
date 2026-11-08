@@ -126,9 +126,11 @@ fn mcp_over_stdio_sets_exposure_and_renders() {
     gradient_png(&input);
     let mut child = Command::new(binary())
         .args(["mcp", input.to_str().unwrap()])
+        // This checks MCP's render semantics; GPU startup and shutdown have their own test below.
+        .env("LIGHTCRAFT_GPU", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -155,8 +157,11 @@ fn mcp_over_stdio_sets_exposure_and_renders() {
     let r = rpc(5, "tools/call", json!({"name": "render_photo", "arguments": {"path": bright.to_str().unwrap()}}));
     assert_eq!(r["result"]["isError"], false, "{r}");
     assert_eq!(r["result"]["content"][0]["type"], "image");
+    drop(rpc);
     drop(stdin);
-    assert!(child.wait().unwrap().success());
+    drop(stdout);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "status {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
     let (a, b) = (mean(&base), mean(&bright));
     println!("cli mcp: mean sRGB exposure 0 → {a:.1}, +1 → {b:.1}");
     assert!(b > a + 10.0, "{a} → {b}");
@@ -205,9 +210,11 @@ fn render_subcommand() {
     gradient_png(&input);
     let plain = tmp("r-plain.png");
     let out = tmp("r-out.jpg");
-    let st = Command::new(binary()).args(["render", input.to_str().unwrap(), "-o", plain.to_str().unwrap()]).status().unwrap();
+    let st =
+        Command::new(binary()).env("LIGHTCRAFT_GPU", "0").args(["render", input.to_str().unwrap(), "-o", plain.to_str().unwrap()]).status().unwrap();
     assert!(st.success());
     let st = Command::new(binary())
+        .env("LIGHTCRAFT_GPU", "0")
         .args(["render", input.to_str().unwrap(), "-o", out.to_str().unwrap(), "--set", "light.exposure=1", "--size", "60"])
         .status()
         .unwrap();
@@ -256,6 +263,7 @@ fn render_settings_applies_an_lcpreset_and_refuses_unknown_files() {
     assert!(st.success());
     let bright = tmp("lcpreset-bright.png");
     let o = Command::new(binary())
+        .env("LIGHTCRAFT_GPU", "0")
         .args(["render", input.to_str().unwrap(), "-o", bright.to_str().unwrap(), "--settings", preset.to_str().unwrap()])
         .output()
         .unwrap();
@@ -266,6 +274,7 @@ fn render_settings_applies_an_lcpreset_and_refuses_unknown_files() {
     std::fs::write(&other, r#"{"format": "other", "version": 1, "presets": []}"#).unwrap();
     let out = tmp("lcpreset-other.png");
     let o = Command::new(binary())
+        .env("LIGHTCRAFT_GPU", "0")
         .args(["render", input.to_str().unwrap(), "-o", out.to_str().unwrap(), "--settings", other.to_str().unwrap()])
         .output()
         .unwrap();
@@ -522,6 +531,7 @@ fn snapshot_defaults_to_cpu_without_gpu_environment_overrides() {
 /// touches the GPU driver and skips when the environment turns the GPU off.
 #[test]
 fn enabling_the_gpu_without_waiting_answers_before_the_device_exists() {
+    let _gpu_turn = gpu_process_turn();
     if std::env::var("LIGHTCRAFT_GPU").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
         lightcraft_testkit::skip!(Gpu, "LIGHTCRAFT_GPU=0: enabling the GPU starts creating a device");
         return;
@@ -610,15 +620,30 @@ fn ephemeral_ports() -> std::sync::MutexGuard<'static, ()> {
     PORTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn gpu_process_turn() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_PROCESSES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_PROCESSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn run_cli(args: &[&str], stdin: Option<&str>) -> (bool, Vec<Value>, String) {
-    let mut child = Command::new(binary()).arg("run").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = Command::new(binary())
+        .env("LIGHTCRAFT_GPU", "0")
+        .arg("run")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     if let Some(text) = stdin {
         child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
     }
     drop(child.stdin.take());
     let o = child.wait_with_output().unwrap();
     let lines = String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    (o.status.success(), lines, String::from_utf8_lossy(&o.stderr).to_string())
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    let diagnostic = if o.status.success() { stderr.into_owned() } else { format!("process exited with {}; stderr: {stderr}", o.status) };
+    (o.status.success(), lines, diagnostic)
 }
 
 /// Windows PowerShell 5.1 writes a UTF-8 BOM; `--script` (file and stdin) must accept it.
@@ -983,6 +1008,7 @@ fn connect_bare_port_is_treated_as_loopback_port() {
 /// reported, and `RUST_LOG=off` silences it. Before, no logger was installed and nothing appeared.
 #[test]
 fn warnings_are_logged_on_stderr() {
+    let _gpu_turn = gpu_process_turn();
     let input = tmp("log-in.png");
     gradient_png(&input);
     let out = tmp("log-out.jpg");

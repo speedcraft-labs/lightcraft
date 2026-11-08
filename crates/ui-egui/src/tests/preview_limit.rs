@@ -575,6 +575,7 @@ mod in_the_loupe {
     // GPU), when the same slider is dragged again, then it drafts small (#330)
     #[test]
     fn a_slow_drag_drafts_small() {
+        let _device_turn = crate::test_gpu::device_turn();
         // the GPU device up front (the loupe never waits for it): with one, it is the earlier
         // drag's time that makes this drag small
         let _ = lightcraft_engine::gpu::available();
@@ -589,6 +590,7 @@ mod in_the_loupe {
     // drag drafts small (#330); proofs into an output space run on the GPU like any render
     #[test]
     fn a_drag_soft_proofed_to_a_device_profile_drafts_small() {
+        let _device_turn = crate::test_gpu::device_turn();
         // the GPU device up front (the loupe never waits for it): with one, this is the case where
         // the GPU is there and the render still goes to the CPU
         let _ = lightcraft_engine::gpu::available();
@@ -606,6 +608,7 @@ mod in_the_loupe {
     // drafted small, as if the proof went to the CPU)
     #[test]
     fn a_drag_soft_proofed_into_a_colour_space_drafts_full_size_on_the_gpu() {
+        let _device_turn = crate::test_gpu::device_turn();
         let gpu = lightcraft_engine::gpu::available();
         let (_fx, mut h, _) = detail();
         assert_eq!(h.app.ui.proof.profile, 0, "a colour space, no device profile");

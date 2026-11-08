@@ -142,6 +142,7 @@ fn a_dialog_list_shrinks_to_fit_a_short_window() {
 /// "Memory for caches" then landed on the gap above it).
 #[test]
 fn gpu_status_never_moves_the_performance_controls() {
+    let _device_turn = crate::test_gpu::device_turn();
     let mut h = demo([1300.0, 820.0]);
     let r = h.request("ui.key", json!({"key": ",", "cmd": true}), T);
     assert_eq!(r["ok"], true, "{r}");

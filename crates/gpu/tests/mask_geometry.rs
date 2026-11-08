@@ -4,6 +4,7 @@
 //! side is `lightcraft-pipeline`'s `tests_mask_geometry`.)
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lightcraft_develop::{BrushStroke, DevelopSettings, LocalAdjustments, Mask, MaskComponent, MaskOp, MaskShape, SegMask};
 use lightcraft_geom::{CropGeometry, Point, Rect};
@@ -148,4 +149,6 @@ fn masks_stay_on_the_content_under_every_geometry_change_on_the_gpu() {
             }
         }
     }
+    lightcraft_gpu::begin_shutdown();
+    assert!(lightcraft_gpu::wait_idle(Duration::from_secs(60)), "drain and destroy the test device before process exit");
 }

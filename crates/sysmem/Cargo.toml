@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "LightCraft sysmem (L0): returns freed allocator memory to the OS. The workspace's only crate allowed `unsafe` (one FFI call)."
 
-# Opts out of the workspace lints only to keep `unsafe_code = "deny"` overridable for the single FFI
-# module below; every other crate root has `#![forbid(unsafe_code)]`. See AGENTS.md.
+# Opts out of the workspace lints only to keep `unsafe_code = "deny"` overridable for the small FFI
+# modules below; every other crate root has `#![forbid(unsafe_code)]`. See AGENTS.md.
 [lints.rust]
 unsafe_code = "deny"
 
@@ -17,4 +17,5 @@ wildcard_imports = "deny"
 dbg_macro = "warn"
 todo = "warn"
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

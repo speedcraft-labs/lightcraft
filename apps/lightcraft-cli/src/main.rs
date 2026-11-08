@@ -186,6 +186,13 @@ fn main() -> ExitCode {
         }
         Some(other) => Err(format!("unknown subcommand `{other}`\n\n{USAGE}")),
     };
+    // A command can start GPU warm-up or a background render worker and return before that work
+    // has entered the driver. Stop new GPU work and wait for anything already inside the driver
+    // before process teardown (issue #620). The UI does the same after stopping its render pool.
+    lightcraft_engine::gpu::begin_shutdown();
+    if !lightcraft_engine::gpu::wait_idle(std::time::Duration::from_secs(120)) {
+        eprintln!("lightcraft-cli: warning: GPU work was still in flight at shutdown");
+    }
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

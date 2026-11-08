@@ -6,8 +6,8 @@
 //! everything ever decoded. `malloc_zone_pressure_relief` (libSystem) returns those pages now.
 //! Elsewhere (glibc, Windows) blocks this large are unmapped when freed: nothing to do.
 //!
-//! This is LightCraft's only crate allowed `unsafe` (one FFI call, in `macos`). Its API is safe,
-//! and on failure or on other platforms it simply releases nothing.
+//! This is LightCraft's only crate allowed `unsafe` (small OS FFI boundaries). Its API is safe,
+//! and on failure or on other platforms it simply does nothing.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 /// Return free allocator pages to the system. Returns the number of bytes released (always 0 on
@@ -21,6 +21,30 @@ pub fn release_free_memory() -> usize {
     #[cfg(not(target_os = "macos"))]
     {
         0
+    }
+}
+
+/// Register a callback to run during normal process shutdown. The callback must not unwind.
+/// Returns `false` on platforms where this hook is not available or registration fails.
+pub fn register_process_exit_handler(handler: extern "C" fn()) -> bool {
+    #[cfg(unix)]
+    {
+        process_exit::register(handler)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = handler;
+        false
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod process_exit {
+    pub fn register(handler: extern "C" fn()) -> bool {
+        // SAFETY: `atexit` retains only a function pointer with the C ABI. The callback contract
+        // is that it does not unwind, and the callback's code remains linked for process life.
+        unsafe { libc::atexit(handler) == 0 }
     }
 }
 
