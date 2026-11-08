@@ -10,6 +10,8 @@
 //! [`crate::begin_shutdown`] (nothing new enters) and [`crate::wait_idle`] (what is in flight
 //! finishes, up to a deadline).
 
+#[cfg(unix)]
+use std::sync::Once;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -28,6 +30,8 @@ pub(crate) struct Gate {
 pub(crate) struct Work<'a>(&'a Gate);
 
 static GATE: Gate = Gate::new();
+#[cfg(unix)]
+static EXIT_HANDLER: Once = Once::new();
 
 /// Start GPU work, or `None` when the process is ending: the caller then does without the GPU.
 /// Work may nest (a render that creates the device).
@@ -45,6 +49,24 @@ pub(crate) fn shutting_down() -> bool {
 
 pub(crate) fn wait_idle(timeout: Duration) -> bool {
     GATE.wait_idle(timeout)
+}
+
+/// Install a last-resort process-exit guard after GPU initialization. Hosts should still shut down
+/// their workers explicitly; this keeps test binaries and simple CLI hosts from ending while a
+/// render is inside the driver.
+pub(crate) fn install_process_exit_handler() {
+    #[cfg(unix)]
+    EXIT_HANDLER.call_once(|| {
+        if !lightcraft_sysmem::register_process_exit_handler(shutdown_at_exit) {
+            log::warn!("gpu: could not register process-exit shutdown guard");
+        }
+    });
+}
+
+#[cfg(unix)]
+extern "C" fn shutdown_at_exit() {
+    begin_shutdown();
+    let _ = wait_idle(Duration::from_secs(120));
 }
 
 impl Gate {
@@ -128,5 +150,35 @@ mod tests {
         }));
         assert!(r.is_err());
         assert!(gate.wait_idle(Duration::ZERO));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_guard_waits_for_in_flight_work() {
+        const CHILD: &str = "LIGHTCRAFT_GPU_EXIT_GUARD_CHILD";
+        const MARKER: &str = "GPU_EXIT_GUARD_WORK_FINISHED";
+        if std::env::var_os(CHILD).is_some() {
+            install_process_exit_handler();
+            let work = enter().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                eprintln!("{MARKER}");
+                drop(work);
+            });
+            std::process::exit(0);
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "exit::tests::process_exit_guard_waits_for_in_flight_work", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(MARKER),
+            "exit did not wait for GPU work; stderr: {}; stdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 }

@@ -3840,6 +3840,7 @@ dependencies = [
  "lightcraft-raster",
  "lightcraft-raw",
  "lightcraft-scenes",
+ "lightcraft-sysmem",
  "lightcraft-testkit",
  "log",
  "pollster 1.0.1",
@@ -4019,6 +4020,9 @@ dependencies = [
 [[package]]
 name = "lightcraft-sysmem"
 version = "0.18.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "lightcraft-testkit"

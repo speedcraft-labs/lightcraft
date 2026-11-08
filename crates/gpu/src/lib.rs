@@ -315,7 +315,7 @@ pub(crate) fn device() -> Option<&'static ctx::Gpu> {
     }
     // creating the device is a long call into the driver: not once the process is ending
     let _work = exit::enter()?;
-    GPU.get_or_init(|| {
+    let gpu = GPU.get_or_init(|| {
         let Some(backends) = backend::compute_backends() else { return Err("disabled by LIGHTCRAFT_GPU_BACKEND=off".into()) };
         let r = backend::with_init_marker(backends, || {
             std::panic::catch_unwind(|| ctx::Gpu::new(backends)).unwrap_or_else(|_| Err("device creation panicked".into()))
@@ -324,9 +324,9 @@ pub(crate) fn device() -> Option<&'static ctx::Gpu> {
             log::warn!("gpu: rendering on the CPU: {why}");
         }
         r
-    })
-    .as_ref()
-    .ok()
+    });
+    exit::install_process_exit_handler();
+    gpu.as_ref().ok()
 }
 
 /// The device if it has been created (never creates it).
@@ -596,6 +596,7 @@ pub fn adopt_window_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu:
             })
         })
     });
+    exit::install_process_exit_handler();
     match (g, declined) {
         (Ok(g), None) if g.window => Ok(()),
         (_, Some(e)) => Err(e),

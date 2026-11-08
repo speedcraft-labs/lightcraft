@@ -248,8 +248,10 @@ impl Backend for HoldAfterFirst {
 
 type Rx = std::sync::mpsc::Receiver<Value>;
 
-fn next_msg(rx: &Rx) -> Value {
-    rx.recv_timeout(Duration::from_secs(30)).expect("MCP reply/progress")
+fn next_msg(rx: &Rx, waiting_for: &str) -> Value {
+    // This test writes eight real 1200×800 images twice; on shared CI CPUs the final reply can
+    // take longer than the 30 seconds allowed for a small synthetic fixture.
+    rx.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|error| panic!("{waiting_for}: MCP reply/progress timed out: {error}"))
 }
 
 fn assert_query_photos(photos: &[Value]) {
@@ -269,7 +271,7 @@ fn run_complete_export(send: &mut impl Write, rx: &Rx, hold: &AtomicBool, ids: &
     writeln!(send, "{request}").unwrap();
     let (mut last, mut notes, mut asked, mut answered) = (-1.0, 0, false, false);
     loop {
-        let value = next_msg(rx);
+        let value = next_msg(rx, "complete export progress or reply");
         if value["method"] == "notifications/progress" {
             assert_eq!(value["params"]["progressToken"], "photos");
             let progress = value["params"]["progress"].as_f64().unwrap();
@@ -303,7 +305,7 @@ fn run_cancelled_export(send: &mut impl Write, rx: &Rx, hold: &AtomicBool, ids: 
     request["params"]["_meta"] = json!({"progressToken":44});
     writeln!(send, "{request}").unwrap();
     loop {
-        let value = next_msg(rx);
+        let value = next_msg(rx, "cancelled export progress");
         assert_ne!(value["id"], 4, "must be cancellable before completion: {value}");
         assert_eq!(value["params"]["progressToken"], 44, "{value}");
         if value["params"]["progress"].as_f64().unwrap() > 0.0 {
@@ -313,7 +315,7 @@ fn run_cancelled_export(send: &mut impl Write, rx: &Rx, hold: &AtomicBool, ids: 
     writeln!(send, "{}", json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}})).unwrap();
     writeln!(send, "{}", call(5, "doc_inspect", json!({}))).unwrap();
     loop {
-        let value = next_msg(rx);
+        let value = next_msg(rx, "request after cancel");
         if value["method"] == "notifications/progress" {
             continue;
         }
@@ -372,7 +374,7 @@ fn export_progress_and_cancel() {
         }
     });
     writeln!(send, "{}", call(1, "query_photos", json!({"limit":8}))).unwrap();
-    let query = next_msg(&rx);
+    let query = next_msg(&rx, "photo query reply");
     let photos = query["result"]["structuredContent"]["photos"].as_array().unwrap();
     assert_query_photos(photos);
     let ids: Vec<_> = photos.iter().map(|p| p["id"].clone()).collect();

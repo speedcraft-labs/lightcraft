@@ -17,6 +17,7 @@ lightcraft-develop = { workspace = true }
 lightcraft-faces = { workspace = true }
 lightcraft-pipeline = { workspace = true }
 log = { workspace = true }
+lightcraft-sysmem = { workspace = true }
 
 # Native only: Metal / Vulkan / DX12 through wgpu (pure Rust; the drivers are the system's).
 # The browser build keeps the CPU pipeline (WebGPU needs async device creation: see docs/gpu-pipeline.md).

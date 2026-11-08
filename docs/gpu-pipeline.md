@@ -106,6 +106,9 @@ on the CPU — then the render pool stops (queued jobs dropped, running ones wai
 `gpu::wait_idle` waits for GPU work on other threads (export, denoise, the device warm-up). One
 deadline of 2 s covers it all; past it the app quits anyway. A job pool that is dropped (headless
 hosts, tests) waits for its running jobs the same way (`JobPool::shutdown`, `crates/preview/src/pool.rs`).
+The CLI also closes the GPU and waits before returning. On Unix, after a GPU device is initialized,
+the GPU crate registers a final process-exit guard for hosts that miss explicit shutdown; it closes
+GPU entry and waits for work already inside the driver (`crates/sysmem` provides the `atexit` hook).
 
 **Crash sentinel.** The desktop app writes `gpu-init.marker` into its settings folder (next to
 `ui.json`: `%APPDATA%\LightCraft`, `~/Library/Application Support/LightCraft`,
