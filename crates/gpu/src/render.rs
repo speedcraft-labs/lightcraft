@@ -1376,6 +1376,26 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
 mod tests {
     use super::*;
 
+    fn brute_force_median_hv(input: &Plane, radius: usize) -> Plane {
+        let pass = |src: &Plane, horizontal: bool| {
+            let mut out = Plane::new(src.width, src.height);
+            for y in 0..src.height {
+                for x in 0..src.width {
+                    let mut window = Vec::with_capacity(radius * 2 + 1);
+                    for k in 0..=radius * 2 {
+                        let offset = k.saturating_add(if horizontal { x } else { y }).saturating_sub(radius);
+                        let (sx, sy) = if horizontal { (offset.min(src.width - 1), y) } else { (x, offset.min(src.height - 1)) };
+                        window.push(src.get(sx, sy));
+                    }
+                    window.sort_by(f32::total_cmp);
+                    out.set(x, y, window[radius]);
+                }
+            }
+            out
+        };
+        pass(&pass(input, true), false)
+    }
+
     #[test]
     fn coverage_mask_matches_per_pixel_decision() {
         use lightcraft_develop::{EmbeddedLens, EmbeddedWarp};
@@ -1491,7 +1511,7 @@ mod tests {
             let input = Plane::from_fn(w, h, |x, y| f32::from_bits(values[(x * 7 + y * 3) % values.len()]));
             let radii: Vec<_> = if (w, h) == (17, 19) { (1..=24).collect() } else { vec![1, 2, 8, 24] };
             for r in radii {
-                let expected = lightcraft_pipeline::local::median_hv(&input, r);
+                let expected = brute_force_median_hv(&input, r);
                 let src = gpu.upload(&input.data);
                 let out = median_hv(&mut cx, &src, w, h, r);
                 let actual: Vec<f32> = cx.read(&out, w * h);
@@ -1501,6 +1521,26 @@ mod tests {
                     "{w}x{h} r={r}"
                 );
             }
+        }
+        let random = Plane::from_fn(17, 19, |x, y| {
+            let mut state = 0x6d2b_79f5u32 ^ (x as u32).wrapping_mul(0x9e37_79b9) ^ (y as u32).wrapping_mul(0x85eb_ca6b);
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            f32::from_bits(state)
+        });
+        for r in [1, 2, 8, 24] {
+            let expected = brute_force_median_hv(&random, r);
+            let src = gpu.upload(&random.data);
+            let out = median_hv(&mut cx, &src, random.width, random.height, r);
+            let actual: Vec<f32> = cx.read(&out, random.width * random.height);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "random {}x{} r={r}",
+                random.width,
+                random.height
+            );
         }
         if let Some(root) = std::env::var_os("ARTCRAFT_HYPER_ROOT").map(std::path::PathBuf::from) {
             let corpus = root.join("corpus/pngsuite");
@@ -1518,7 +1558,7 @@ mod tests {
             let plane16 = Plane::from_fn(w16, h16, |x, y| f32::from(pixels16.get_pixel(x as u32, y as u32).0[0]));
             for (plane, w, h, name) in [(&plane8, w, h, "8-bit"), (&plane16, w16, h16, "16-bit")] {
                 for r in [1, 3, 9, 24] {
-                    let expected = lightcraft_pipeline::local::median_hv(plane, r);
+                    let expected = brute_force_median_hv(plane, r);
                     let src = gpu.upload(&plane.data);
                     let out = median_hv(&mut cx, &src, w, h, r);
                     let actual: Vec<f32> = cx.read(&out, w * h);
@@ -1558,6 +1598,12 @@ mod tests {
         let logical_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
         let isolated = std::env::var("CRAFT_BENCH_ISOLATED").unwrap_or_default();
         let input = Plane::from_fn(w, h, |x, y| ((x * 37 + y * 73) % 256) as f32 / 255.0);
+        let (cpu_w, cpu_h) = (3000, 2000);
+        let image8 = lightcraft_raster::Image::from_fn(cpu_w, cpu_h, |x, y| ((x * 37 + y * 73) % 256) as u8);
+        let image16 =
+            lightcraft_raster::Image::from_fn(cpu_w, cpu_h, |x, y| ((x as u32 * 40_503 + y as u32 * 7_919 + (x * y) as u32 * 17) & 0xffff) as u16);
+        let plane8 = Plane { width: cpu_w, height: cpu_h, data: image8.data.iter().map(|&v| f32::from(v)).collect() };
+        let plane16 = Plane { width: cpu_w, height: cpu_h, data: image16.data.iter().map(|&v| f32::from(v)).collect() };
         let src = gpu.upload(&input.data);
         let mut cx = Cx::new(gpu);
         eprintln!("median benchmark: {} ({:?})", gpu.info.name, gpu.info.backend);
@@ -1616,11 +1662,97 @@ mod tests {
                 new_ms,
                 hash_f32(&new)
             );
+
+            let old8 = local::median_hv(&plane8, r);
+            let new8 = lightcraft_raster::median::median_u8_hv(&image8, r);
+            assert_eq!(
+                old8.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                new8.data.iter().map(|&v| f32::from(v).to_bits()).collect::<Vec<_>>(),
+                "CPU u8 parity r={r}"
+            );
+            let (old8_ms, new8_ms) = paired_cpu_times(
+                || {
+                    std::hint::black_box(local::median_hv(&plane8, r));
+                },
+                || {
+                    std::hint::black_box(lightcraft_raster::median::median_u8_hv(&image8, r));
+                },
+            );
+            let ratios: Vec<f64> = new8_ms.iter().zip(old8_ms.iter()).map(|(n, o)| n / o).collect();
+            let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
+            eprintln!(
+                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u8\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+                cpu_model,
+                kernel,
+                loadavg.trim(),
+                isolated,
+                head_rev,
+                old8_ms,
+                new8_ms,
+                hash_u8(&new8.data)
+            );
+
+            let old16 = local::median_hv(&plane16, r);
+            let new16 = lightcraft_raster::median::median_u16_hv(&image16, r);
+            assert_eq!(
+                old16.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                new16.data.iter().map(|&v| f32::from(v).to_bits()).collect::<Vec<_>>(),
+                "CPU u16 parity r={r}"
+            );
+            let (old16_ms, new16_ms) = paired_cpu_times(
+                || {
+                    std::hint::black_box(local::median_hv(&plane16, r));
+                },
+                || {
+                    std::hint::black_box(lightcraft_raster::median::median_u16_hv(&image16, r));
+                },
+            );
+            let ratios: Vec<f64> = new16_ms.iter().zip(old16_ms.iter()).map(|(n, o)| n / o).collect();
+            let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
+            eprintln!(
+                "{{\"kind\":\"median-cpu-paired\",\"dtype\":\"u16\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"head_rev\":\"{}\",\"width\":{cpu_w},\"height\":{cpu_h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
+                cpu_model,
+                kernel,
+                loadavg.trim(),
+                isolated,
+                head_rev,
+                old16_ms,
+                new16_ms,
+                hash_u16(&new16.data)
+            );
         }
+    }
+
+    fn paired_cpu_times(mut baseline: impl FnMut(), mut candidate: impl FnMut()) -> ([f64; 10], [f64; 10]) {
+        baseline();
+        candidate();
+        let mut baseline_ms = [0.0; 10];
+        let mut candidate_ms = [0.0; 10];
+        for i in 0..10 {
+            for candidate_first in [i % 2 == 1, i % 2 == 0] {
+                let start = std::time::Instant::now();
+                if candidate_first {
+                    candidate();
+                    candidate_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
+                } else {
+                    baseline();
+                    baseline_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
+        }
+        (baseline_ms, candidate_ms)
     }
 
     fn hash_f32(values: &[f32]) -> u64 {
         values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(v.to_bits())).wrapping_mul(0x100000001b3))
+    }
+
+    fn hash_u8(values: &[u8]) -> u64 {
+        values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(*v)).wrapping_mul(0x100000001b3))
+    }
+
+    fn hash_u16(values: &[u16]) -> u64 {
+        values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(*v)).wrapping_mul(0x100000001b3))
     }
 
     fn bootstrap_median_ci(ratios: &[f64]) -> (f64, f64, f64) {
