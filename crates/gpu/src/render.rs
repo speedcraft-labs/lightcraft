@@ -1596,7 +1596,6 @@ mod tests {
             }
             let old: Vec<f32> = cx.read(&old_out, w * h);
             let new: Vec<f32> = cx.read(&new_out, w * h);
-            let new: Vec<f32> = cx.read(&new, w * h);
             assert_eq!(old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "r={r}");
             let ratios: Vec<f64> = new_ms.iter().zip(old_ms.iter()).map(|(n, o)| n / o).collect();
             let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
