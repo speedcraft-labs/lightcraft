@@ -1440,9 +1440,9 @@ mod tests {
             return;
         };
         let entries: Vec<&str> = super::MODULES.iter().flat_map(|m| m.entries.iter().copied()).collect();
-        assert!(g.kernels.len() >= entries.len());
+        assert!(g.kernels.lock().unwrap().len() >= entries.len());
         for e in entries {
-            assert!(g.kernels.contains_key(e), "no kernel for {e}");
+            assert!(g.has_kernel(e), "no kernel for {e}");
         }
     }
 
