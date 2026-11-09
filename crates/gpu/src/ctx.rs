@@ -131,6 +131,7 @@ pub(crate) const MEDIAN_NETWORKS: [(&str, &str); 24] = [
     ("median_h_24", "median_v_24"),
 ];
 
+#[derive(Clone)]
 struct Kernel {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
@@ -187,35 +188,7 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
     if let Some(e) = pop_scopes(scopes) {
         return Err(e);
     }
-    let blur = &MODULES[1];
-    let blur_prepared = &prepared[1];
-    let networks: Vec<_> = MEDIAN_NETWORKS
-        .iter()
-        .enumerate()
-        .filter_map(|(index, names)| {
-            let scopes = push_scopes(device);
-            let src = format!("{}{}", module_source(blur, &consts), median_network_source(index + 1));
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
-            if pop_scopes(scopes).is_some() {
-                return None;
-            }
-            Some((
-                Prepared {
-                    module,
-                    layout: blur_prepared.layout.clone(),
-                    pipeline_layout: blur_prepared.pipeline_layout.clone(),
-                    nbuf: blur_prepared.nbuf,
-                },
-                names,
-            ))
-        })
-        .collect();
-    let jobs: Vec<(&Prepared, &'static str)> = MODULES
-        .iter()
-        .zip(&prepared)
-        .flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e)))
-        .chain(networks.iter().flat_map(|(p, (horizontal, vertical))| [(p, *horizontal), (p, *vertical)]))
-        .collect();
+    let jobs: Vec<(&Prepared, &'static str)> = MODULES.iter().zip(&prepared).flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e))).collect();
     let next = AtomicUsize::new(0);
     let built = std::sync::Mutex::new(HashMap::with_capacity(jobs.len()));
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(jobs.len()).saturating_sub(1);
@@ -236,6 +209,34 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
         return Err(e);
     }
     Ok(built.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// The optional median pair for one radius, sharing the generic blur binding layout.
+fn build_median_pair(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, radius: usize) -> Result<(Kernel, Kernel), String> {
+    let &(horizontal, vertical) = MEDIAN_NETWORKS.get(radius.wrapping_sub(1)).ok_or("unknown median radius")?;
+    let blur = &MODULES[1];
+    let scopes = push_scopes(device);
+    let source = format!("{}{}", module_source(blur, &constants()), median_network_source(radius));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(source.into()) });
+    let pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(layout)], immediate_size: 0 });
+    let make = |name| Kernel {
+        pipeline: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(name),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(name),
+            compilation_options: Default::default(),
+            cache: None,
+        }),
+        layout: layout.clone(),
+        nbuf: blur.bindings.len(),
+    };
+    let pair = (make(horizontal), make(vertical));
+    match pop_scopes(scopes) {
+        Some(error) => Err(error),
+        None => Ok(pair),
+    }
 }
 
 /// One worker of [`build_kernels`]: build kernels until none is left; the first error its scopes caught.
@@ -438,7 +439,9 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
-    kernels: HashMap<&'static str, Kernel>,
+    // One cache for eager upstream kernels and lazily built optional median pairs.
+    // None remembers a rejected optional kernel so later frames keep the generic fallback.
+    kernels: std::sync::Mutex<HashMap<&'static str, Option<Kernel>>>,
     dummy: wgpu::Buffer,
     /// Recycled buffers (see [`Buf`]).
     free: std::sync::Mutex<Vec<Tracked>>,
@@ -600,8 +603,28 @@ fn median_network_source(radius: usize) -> String {
 
 impl Gpu {
     pub(crate) fn has_kernel(&self, name: &str) -> bool {
-        self.kernels.contains_key(name)
+        self.kernel(name).is_some()
     }
+
+    fn kernel(&self, name: &str) -> Option<Kernel> {
+        let mut kernels = self.kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(kernel) = kernels.get(name) {
+            return kernel.clone();
+        }
+        let radius = MEDIAN_NETWORKS.iter().position(|&(h, v)| name == h || name == v)? + 1;
+        let (horizontal, vertical) = MEDIAN_NETWORKS[radius - 1];
+        // Device creation must not compile all 48 optional sorting-network pipelines: the
+        // NVIDIA compiler takes minutes, delaying startup and timing out device-loss tests.
+        // Compile only the requested radius, once; a refusal keeps upstream's generic median.
+        let pair = kernels.get("median_h").and_then(Option::as_ref).and_then(|base| {
+            build_median_pair(&self.device, &base.layout, radius).map_err(|e| log::warn!("gpu: median radius {radius} unavailable: {e}")).ok()
+        });
+        let (h, v) = pair.map_or((None, None), |(h, v)| (Some(h), Some(v)));
+        kernels.insert(horizontal, h);
+        kernels.insert(vertical, v);
+        kernels.get(name).cloned().flatten()
+    }
+
     /// Create a device on the best available adapter (no software adapter unless
     /// `LIGHTCRAFT_GPU_ALLOW_SOFTWARE`), or why there is none.
     pub fn new(backends: wgpu::Backends) -> Result<Gpu, String> {
@@ -695,7 +718,17 @@ impl Gpu {
             max_buffer >> 20,
             if window { ", the window's device" } else { "" }
         );
-        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer, window, grain: Default::default() })
+        Ok(Gpu {
+            device,
+            queue,
+            info,
+            kernels: std::sync::Mutex::new(kernels.into_iter().map(|(name, kernel)| (name, Some(kernel))).collect()),
+            dummy,
+            free: Default::default(),
+            max_buffer,
+            window,
+            grain: Default::default(),
+        })
     }
 
     /// A buffer of `len` 32-bit values with undefined contents (a recycled one when possible).
@@ -938,7 +971,7 @@ impl Gpu {
         if failed() {
             return; // the render is redone on the CPU: don't spend the GPU on it
         }
-        let Some(k) = self.kernels.get(name) else {
+        let Some(k) = self.kernel(name) else {
             // a kernel name typo: fail this render over to the CPU instead of crashing
             fail(FailKind::Fatal, format!("unknown kernel {name}"));
             return;
@@ -1449,6 +1482,22 @@ mod tests {
         assert!(status.success(), "{child}: {status:?}\n{stdout}\n{stderr}");
         assert!(stdout.contains("CHILD: survived"), "{child}: {stdout}");
         Some(stdout)
+    }
+
+    #[test]
+    fn device_startup_defers_optional_median_networks_until_requested() {
+        let Some(backends) = crate::backend::compute_backends() else { return };
+        let Ok(gpu) = super::Gpu::new(backends) else {
+            lightcraft_testkit::skip!(Gpu, "no GPU for lazy median startup check");
+            return;
+        };
+        let optional = || gpu.kernels.lock().unwrap().keys().filter(|name| name.starts_with("median_h_") || name.starts_with("median_v_")).count();
+        assert_eq!(optional(), 0, "startup must not compile radius-specific sorting networks");
+        let (h, v) = super::MEDIAN_NETWORKS[0];
+        assert!(gpu.has_kernel(h) && gpu.has_kernel(v));
+        assert_eq!(optional(), 2, "only the requested pair is compiled and cached");
+        assert!(gpu.has_kernel(h));
+        assert_eq!(optional(), 2, "the cached pair is reused");
     }
 
     /// An upload reaches the device whole: it is copied into staging memory in parallel parts, the last one
