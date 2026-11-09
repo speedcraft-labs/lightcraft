@@ -208,7 +208,7 @@ pub enum Blur {
 impl Blur {
     pub fn for_settings(settings: &DevelopSettings) -> Self {
         match settings.process.process() {
-            Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::ForkGaussianV1 => Self::Legacy,
+            Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => Self::Legacy,
             Process::ForkGaussianV1 => Self::Recursive,
         }
     }

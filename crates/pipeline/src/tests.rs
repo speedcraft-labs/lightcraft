@@ -306,7 +306,10 @@ fn process_switch_rebuilds_recursive_blur_stages() {
         let mut versions = Vec::new();
         for process in [Process::V1, Process::V2, Process::V3, Process::V4, Process::ForkGaussianV1, Process::V4, Process::V1] {
             settings.process = process.version();
-            assert_eq!(Blur::for_settings(&settings).gaussian(&probe, 1.0), if process == Process::ForkGaussianV1 { &current } else { &legacy }.clone());
+            assert_eq!(
+                Blur::for_settings(&settings).gaussian(&probe, 1.0),
+                if process == Process::ForkGaussianV1 { &current } else { &legacy }.clone()
+            );
             let cached = render_cached(&src, &info, &settings, &request, &cache).image;
             assert_eq!(cached, render(&src, &info, &settings, &request).image, "{process:?} {:?}", request.quality);
             versions.push(cached);
