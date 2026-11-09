@@ -213,7 +213,7 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
 
 /// The optional median pair for one radius, sharing the generic blur binding layout.
 fn build_median_pair(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, radius: usize) -> Result<(Kernel, Kernel), String> {
-    let &(horizontal, vertical) = MEDIAN_NETWORKS.get(radius.wrapping_sub(1)).ok_or("unknown median radius")?;
+    let &(horizontal, vertical) = MEDIAN_NETWORKS.get(radius.checked_sub(1).ok_or("unknown median radius")?).ok_or("unknown median radius")?;
     let blur = &MODULES[1];
     let scopes = push_scopes(device);
     let source = format!("{}{}", module_source(blur, &constants()), median_network_source(radius));
@@ -1486,9 +1486,16 @@ mod tests {
 
     #[test]
     fn device_startup_defers_optional_median_networks_until_requested() {
-        let Some(backends) = crate::backend::compute_backends() else { return };
-        let Ok(gpu) = super::Gpu::new(backends) else {
+        if run_child("lazy_median_child").is_none() {
             lightcraft_testkit::skip!(Gpu, "no GPU for lazy median startup check");
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated by device_startup_defers_optional_median_networks_until_requested"]
+    fn lazy_median_child() {
+        let Some(gpu) = crate::device() else {
+            println!("CHILD: no GPU");
             return;
         };
         let optional = || gpu.kernels.lock().unwrap().keys().filter(|name| name.starts_with("median_h_") || name.starts_with("median_v_")).count();
@@ -1498,6 +1505,7 @@ mod tests {
         assert_eq!(optional(), 2, "only the requested pair is compiled and cached");
         assert!(gpu.has_kernel(h));
         assert_eq!(optional(), 2, "the cached pair is reused");
+        println!("CHILD: survived");
     }
 
     /// An upload reaches the device whole: it is copied into staging memory in parallel parts, the last one
