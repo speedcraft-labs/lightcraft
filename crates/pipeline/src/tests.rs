@@ -304,16 +304,16 @@ fn process_switch_rebuilds_recursive_blur_stages() {
     assert_ne!(legacy, current);
     for request in [RenderRequest::fit(160, 120), RenderRequest { quality: Quality::Draft, ..RenderRequest::fit(120, 80) }] {
         let mut versions = Vec::new();
-        for process in [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V4, Process::V1] {
+        for process in [Process::V1, Process::V2, Process::V3, Process::V4, Process::ForkGaussianV1, Process::V4, Process::V1] {
             settings.process = process.version();
-            assert_eq!(Blur::for_settings(&settings).gaussian(&probe, 1.0), if process == Process::V5 { &current } else { &legacy }.clone());
+            assert_eq!(Blur::for_settings(&settings).gaussian(&probe, 1.0), if process == Process::ForkGaussianV1 { &current } else { &legacy }.clone());
             let cached = render_cached(&src, &info, &settings, &request, &cache).image;
             assert_eq!(cached, render(&src, &info, &settings, &request).image, "{process:?} {:?}", request.quality);
             versions.push(cached);
         }
         assert_ne!(versions[3], versions[4]);
         assert_eq!(versions[0], versions[6]);
-        assert_eq!(versions[3], versions[5], "switching back from V5 restores V4 output");
+        assert_eq!(versions[3], versions[5], "switching back from ForkGaussianV1 restores V4 output");
     }
 }
 
@@ -884,6 +884,48 @@ fn sliver_crops_render_quickly_with_wide_stages_on() {
         assert!(t.elapsed().as_secs_f64() < 20.0, "{rect:?}: {:?}", t.elapsed());
         assert!(r.image.width >= 1 && r.image.height >= 1, "{rect:?}");
     }
+}
+
+// Given a cached render with one process, a change to a process with another colour filter (Update
+// to Current Process, undo) renders like a fresh render, not the cached denoised image
+#[test]
+fn a_process_change_does_not_reuse_the_other_colour_filter() {
+    use crate::{StageCache, render_cached};
+    use lightcraft_develop::Process;
+    use std::sync::Arc;
+    let src = Arc::new(colour_noise_scene(128, 96, 128));
+    let info = SourceInfo::default();
+    let req = RenderRequest::fit(128, 96);
+    let cache = StageCache::default();
+    let mut old = DevelopSettings::default();
+    old.detail.nr_color = 25.0;
+    old.detail.nr_color_smoothness = 0.0;
+    old.process = Process::V2.version();
+    let current = DevelopSettings { process: Process::LATEST.version(), ..old.clone() };
+    let first = render_cached(&src, &info, &old, &req, &cache).image;
+    let fresh = render(&src, &info, &current, &req).image;
+    assert!(max_diff(&first, &fresh) > 0, "the two colour filters differ on this scene");
+    assert_eq!(render_cached(&src, &info, &current, &req, &cache).image, fresh, "process update");
+    assert_eq!(render_cached(&src, &info, &old, &req, &cache).image, first, "undo");
+}
+
+/// Flat grey with chroma noise: `quiet` columns on the left with little noise, the rest with much.
+pub(crate) fn colour_noise_scene(w: usize, h: usize, quiet: usize) -> Rgb32f {
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut noise = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 2.0
+    };
+    let mut img = Rgb32f::new(w, h);
+    for (i, p) in img.data.iter_mut().enumerate() {
+        let sigma = if i % w < quiet { 0.001 } else { 0.015 };
+        let y = 0.04f32;
+        let (r, b) = (y + noise() * sigma, y + noise() * sigma);
+        *p = [r, (y - 0.2627 * r - 0.0593 * b) / 0.6780, b];
+    }
+    img
 }
 
 /// A crop of no width used to give grain NaN coordinates (and NaN pixels); the render stays finite.

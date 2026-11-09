@@ -1,7 +1,7 @@
 # Recursive Gaussian (issue #176)
 
-LightCraft process V5 replaces the CPU three-box Gaussian with the shared
-`craft-blur` filter. V1–V4 keep the previous box output so existing saved edits
+LightCraft process ForkGaussianV1 (`2147483649` / `0x80000001`) replaces the CPU three-box Gaussian with the shared
+`craft-blur` filter. upstream V1–V7 keep the previous box output so existing saved edits
 render as before. The GPU filter is unchanged.
 
 ## What changes
@@ -12,7 +12,7 @@ actual blur jump as sigma changes. The measured variance error can reach the
 `1 / (3 sigma)` limit; at sigma 1 the three-box selection has variance `2/3`
 instead of the requested `1`.
 
-V5 uses the normalized sampled Gaussian below sigma 2.5 and the variance
+ForkGaussianV1 (`2147483649` / `0x80000001`) uses the normalized sampled Gaussian below sigma 2.5 and the variance
 calibrated third-order Young–van Vliet recurrence from sigma 2.5 onward. The
 recurrence refines its pole parameter to match the requested second moment and
 uses Triggs–Sdika initialization for clamped boundaries. It carries f64 state;
@@ -37,13 +37,22 @@ edge contracts in [`craft-blur`](https://github.com/speedcraft-labs/craft-libs/t
 
 The process-aware CPU blur paths, including noise reduction, texture, dehaze,
 mask refinement, local adjustments and heal overlays, choose their blur by
-process version. Process V5 is included in the stage-cache key so switching
-between V4 and V5 recomputes affected planes. Unversioned helper APIs preserve
+process version. Process ForkGaussianV1 (`2147483649` / `0x80000001`) is included in the stage-cache key so switching
+between V4 and ForkGaussianV1 (`2147483649` / `0x80000001`) recomputes affected planes. Unversioned helper APIs preserve
 their legacy box behavior for callers that do not provide process settings.
 
-No V1–V4 golden changed. The before/after impulse test confirms that V5 has the
+No upstream V1–V7 golden changed. The before/after impulse test confirms that ForkGaussianV1 (`2147483649` / `0x80000001`) has the
 corrected width while the legacy helper retains the old cascade. The
 pixel-scale SharpenMask preview uses a separate sampled kernel and is unchanged.
 The process-switch test checks cached and fresh renders with noise reduction,
 local adjustments, a subject mask and a heal spot, then switches back to V4 to
 confirm its output is restored.
+
+## Upstream sync #312
+
+The old fork process 5 is disposable test/benchmark data, per the maintainer.
+There is no migration path. Upstream owns ordinary process numbers, including
+V5 highlight roll-off, V6 joint colour NR and V7 crystal grain. New fork-only
+render versions use the high-bit namespace starting at `0x80000001` to avoid
+reusing upstream sequence numbers on each sync. ForkGaussianV1 builds on all
+upstream V7 behavior and changes only the versioned CPU Gaussian selection.
