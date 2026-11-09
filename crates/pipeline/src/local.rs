@@ -216,7 +216,7 @@ impl Blur {
     pub fn gaussian<T: Pixel>(self, image: &lightcraft_raster::Image<T>, sigma: f32) -> lightcraft_raster::Image<T> {
         match self {
             Self::Legacy => lightcraft_raster::blur::gaussian_box(image, sigma),
-            Self::Recursive => lightcraft_raster::blur::gaussian(image, sigma),
+            Self::Recursive => lightcraft_raster::blur::gaussian_recursive(image, sigma),
         }
     }
 }

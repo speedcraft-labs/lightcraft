@@ -300,7 +300,7 @@ fn process_switch_rebuilds_recursive_blur_stages() {
     });
     let probe = lightcraft_raster::Plane::from_fn(65, 1, |index, _| f32::from(index == 32));
     let legacy = lightcraft_raster::blur::gaussian_box(&probe, 1.0);
-    let current = lightcraft_raster::blur::gaussian(&probe, 1.0);
+    let current = lightcraft_raster::blur::gaussian_recursive(&probe, 1.0);
     assert_ne!(legacy, current);
     for request in [RenderRequest::fit(160, 120), RenderRequest { quality: Quality::Draft, ..RenderRequest::fit(120, 80) }] {
         let mut versions = Vec::new();

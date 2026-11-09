@@ -1,6 +1,7 @@
 //! Separable Gaussian blur: variance-exact sampled windows below 2.5 px, otherwise a
 //! third-order Young–van Vliet recursive filter with Triggs–Sdika clamp boundaries.
-//! [`gaussian_box`] preserves the legacy process and the GPU's three-box approximation.
+//! The unversioned [`gaussian`] API retains upstream's three-box approximation.
+//! [`gaussian_recursive`] is selected explicitly by the fork render process.
 
 use crate::resample::Pixel;
 use crate::{Image, par_rows};
@@ -156,6 +157,12 @@ pub fn gaussian_box<T: Pixel>(img: &Image<T>, sigma: f32) -> Image<T> {
     a
 }
 
+/// Upstream's unversioned Gaussian API. Keep new upstream callers (including colour NR)
+/// on their original kernel; only the fork render process opts into [`gaussian_recursive`].
+pub fn gaussian<T: Pixel>(image: &Image<T>, sigma: f32) -> Image<T> {
+    gaussian_box(image, sigma)
+}
+
 /// Apply the shared Young–van Vliet kernel to built-in floating pixel formats. `None` means an
 /// unsupported layout/input and lets the caller retain the legacy custom-pixel path.
 pub(crate) fn shared_image<const N: usize, T: Pixel>(
@@ -184,7 +191,7 @@ pub(crate) fn shared_image<const N: usize, T: Pixel>(
 
 /// Blur with the variance-calibrated sampled kernel at small sigma and the shared recursive
 /// Gaussian otherwise. Legacy saved renders stay on [`gaussian_box`] through their process version.
-pub fn gaussian<T: Pixel>(image: &Image<T>, sigma: f32) -> Image<T> {
+pub fn gaussian_recursive<T: Pixel>(image: &Image<T>, sigma: f32) -> Image<T> {
     if !sigma.is_finite() || sigma <= 0.0 || image.width == 0 || image.height == 0 {
         return gaussian_box(image, sigma);
     }
@@ -319,6 +326,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn unversioned_gaussian_keeps_upstream_box_output_and_fork_is_explicit() {
+        let mut impulse = Image::<f32>::new(101, 1);
+        impulse.set(50, 0, 1.0);
+        for sigma in [0.5, 1.0, 4.0, 8.0] {
+            assert_eq!(gaussian(&impulse, sigma), gaussian_box(&impulse, sigma));
+        }
+        assert_ne!(gaussian_recursive(&impulse, 1.0), gaussian(&impulse, 1.0));
+    }
 
     #[test]
     fn preserves_constant_and_mass() {

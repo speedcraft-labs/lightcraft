@@ -56,3 +56,7 @@ V5 highlight roll-off, V6 joint colour NR and V7 crystal grain. New fork-only
 render versions use the high-bit namespace starting at `0x80000001` to avoid
 reusing upstream sequence numbers on each sync. ForkGaussianV1 builds on all
 upstream V7 behavior and changes only the versioned CPU Gaussian selection.
+
+The unversioned raster `gaussian` API keeps upstream's three-box output, including
+new upstream joint colour NR callers. Only the fork process selects
+`gaussian_recursive`; upstream V1–V7 do not inherit the fork kernel.
