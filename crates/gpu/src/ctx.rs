@@ -1,6 +1,7 @@
 //! The wgpu device, the compiled kernels, buffers, dispatch and readback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// A kernel module: WGSL source, its storage bindings (name, writable, element type) after the
@@ -140,8 +141,9 @@ fn pop_scopes(scopes: [wgpu::ErrorScopeGuard; 2]) -> Option<String> {
     internal.or(validation).map(|e| e.to_string())
 }
 
-/// Build every kernel. A kernel the driver's compiler refuses is a validation or an internal error,
-/// and then there is no GPU, not a half-built one.
+/// Build the baseline kernels. Radius-specialized median kernels are compiled when first used.
+/// A baseline kernel the driver's compiler refuses is a validation or an internal error, and then
+/// there is no GPU, not a half-built one.
 ///
 /// Issue #2936: built one after another, the 27 pipelines took ~2.2 s on an Intel iGPU under DX12
 /// (device start-up 1.7–4.4 s in all, 7 s on the first run after an install), where FXC (issue #471)
@@ -170,35 +172,7 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
     if let Some(e) = pop_scopes(scopes) {
         return Err(e);
     }
-    let blur = &MODULES[1];
-    let blur_prepared = &prepared[1];
-    let networks: Vec<_> = MEDIAN_NETWORKS
-        .iter()
-        .enumerate()
-        .filter_map(|(index, names)| {
-            let scopes = push_scopes(device);
-            let src = format!("{}{}", module_source(blur, &consts), median_network_source(index + 1));
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
-            if pop_scopes(scopes).is_some() {
-                return None;
-            }
-            Some((
-                Prepared {
-                    module,
-                    layout: blur_prepared.layout.clone(),
-                    pipeline_layout: blur_prepared.pipeline_layout.clone(),
-                    nbuf: blur_prepared.nbuf,
-                },
-                names,
-            ))
-        })
-        .collect();
-    let jobs: Vec<(&Prepared, &'static str)> = MODULES
-        .iter()
-        .zip(&prepared)
-        .flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e)))
-        .chain(networks.iter().flat_map(|(p, (horizontal, vertical))| [(p, *horizontal), (p, *vertical)]))
-        .collect();
+    let jobs: Vec<(&Prepared, &'static str)> = MODULES.iter().zip(&prepared).flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e))).collect();
     let next = AtomicUsize::new(0);
     let built = std::sync::Mutex::new(HashMap::with_capacity(jobs.len()));
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(jobs.len()).saturating_sub(1);
@@ -249,6 +223,43 @@ fn build_jobs(
         }
     }
     error
+}
+
+/// Build the specialized horizontal and vertical median kernels for one radius. Failures leave the
+/// generic median kernels available as a fallback.
+fn build_median_kernels(device: &wgpu::Device, radius: usize) -> Option<[(&'static str, Kernel); 2]> {
+    let &(horizontal, vertical) = MEDIAN_NETWORKS.get(radius.checked_sub(1)?)?;
+    let blur = &MODULES[1];
+    let scopes = push_scopes(device);
+    let source = format!("{}{}", module_source(blur, &constants()), median_network_source(radius));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(source.into()) });
+    let mut entries = vec![storage_entry(0, true)];
+    entries.extend(blur.bindings.iter().enumerate().map(|(i, (_, writable, _))| storage_entry(i as u32 + 1, !writable)));
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+    let pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+    if pop_scopes(scopes).is_some() {
+        return None;
+    }
+
+    let mut built = Vec::with_capacity(2);
+    for entry in [horizontal, vertical] {
+        let scopes = push_scopes(device);
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if pop_scopes(scopes).is_some() {
+            return None;
+        }
+        built.push((entry, Kernel { pipeline, layout: layout.clone(), nbuf: blur.bindings.len() }));
+    }
+    let mut built = built.into_iter();
+    Some([built.next()?, built.next()?])
 }
 
 /// A device buffer of `len` 32-bit values.
@@ -411,7 +422,8 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
-    kernels: HashMap<&'static str, Kernel>,
+    kernels: RwLock<HashMap<&'static str, Kernel>>,
+    median_failed: std::sync::Mutex<HashSet<usize>>,
     dummy: wgpu::Buffer,
     /// Recycled buffers (see [`Buf`]).
     free: std::sync::Mutex<Vec<Tracked>>,
@@ -561,8 +573,40 @@ fn median_network_source(radius: usize) -> String {
 }
 
 impl Gpu {
+    #[cfg(test)]
     pub(crate) fn has_kernel(&self, name: &str) -> bool {
-        self.kernels.contains_key(name)
+        self.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(name)
+    }
+
+    /// Compile a radius-specific median pair on first use. The write lock keeps concurrent first
+    /// renders from compiling the same pair more than once.
+    pub(crate) fn ensure_median_kernels(&self, radius: usize) -> bool {
+        let Some(&(horizontal, vertical)) = radius.checked_sub(1).and_then(|index| MEDIAN_NETWORKS.get(index)) else {
+            return false;
+        };
+        {
+            let kernels = self.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if kernels.contains_key(horizontal) && kernels.contains_key(vertical) {
+                return true;
+            }
+        }
+        let mut kernels = self.kernels.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kernels.contains_key(horizontal) && kernels.contains_key(vertical) {
+            return true;
+        }
+        let failed = self.median_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failed.contains(&radius) {
+            return false;
+        }
+        drop(failed);
+        let Some(built) = build_median_kernels(&self.device, radius) else {
+            self.median_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(radius);
+            return false;
+        };
+        for (name, kernel) in built {
+            kernels.insert(name, kernel);
+        }
+        true
     }
     /// Create a device on the best available adapter (no software adapter unless
     /// `LIGHTCRAFT_GPU_ALLOW_SOFTWARE`), or why there is none.
@@ -657,7 +701,17 @@ impl Gpu {
             max_buffer >> 20,
             if window { ", the window's device" } else { "" }
         );
-        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer, window })
+        Ok(Gpu {
+            device,
+            queue,
+            info,
+            kernels: RwLock::new(kernels),
+            median_failed: Default::default(),
+            dummy,
+            free: Default::default(),
+            max_buffer,
+            window,
+        })
     }
 
     /// A buffer of `len` 32-bit values with undefined contents (a recycled one when possible).
@@ -852,7 +906,8 @@ impl Gpu {
         if failed() {
             return; // the render is redone on the CPU: don't spend the GPU on it
         }
-        let Some(k) = self.kernels.get(name) else {
+        let kernels = self.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(k) = kernels.get(name) else {
             // a kernel name typo: fail this render over to the CPU instead of crashing
             fail(FailKind::Fatal, format!("unknown kernel {name}"));
             return;
@@ -1303,9 +1358,10 @@ mod tests {
             return;
         };
         let entries: Vec<&str> = super::MODULES.iter().flat_map(|m| m.entries.iter().copied()).collect();
-        assert!(g.kernels.len() >= entries.len());
+        let kernels = g.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(kernels.len() >= entries.len());
         for e in entries {
-            assert!(g.kernels.contains_key(e), "no kernel for {e}");
+            assert!(kernels.contains_key(e), "no kernel for {e}");
         }
     }
 
