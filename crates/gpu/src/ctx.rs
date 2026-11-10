@@ -750,6 +750,7 @@ impl Gpu {
             dummy,
             free: Default::default(),
             max_buffer,
+            grain: Default::default(),
             window,
         })
     }
