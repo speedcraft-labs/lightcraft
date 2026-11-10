@@ -66,10 +66,9 @@ pub(crate) fn install_process_exit_handler() {
 #[cfg(unix)]
 extern "C" fn shutdown_at_exit() {
     begin_shutdown();
-    // Rust TLS destructors have already run, so don't call back into wgpu/the driver here. Hosts
-    // drain submitted work through `crate::wait_idle` before returning; this last-resort guard only
-    // ensures no API call is still inside the driver as process teardown begins.
-    let _ = wait_idle(Duration::from_secs(120));
+    // `GPU` and its device are process statics, not TLS. After all callers leave the driver,
+    // finish submitted work too; otherwise the driver's process teardown can race its own queue.
+    let _ = crate::drain_idle(Duration::from_secs(120));
 }
 
 impl Gate {
