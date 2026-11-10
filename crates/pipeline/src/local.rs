@@ -4,8 +4,7 @@
 use lightcraft_color::cct::{temp_tint_to_xy, wb_matrix, xy_to_temp_tint};
 use lightcraft_color::{REC2020, luminance_2020};
 use lightcraft_develop::{DevelopSettings, Process};
-use lightcraft_raster::blur::{gauss_taps, gaussian_taps};
-use lightcraft_raster::resample::Pixel;
+use lightcraft_raster::blur::{gauss_taps, gaussian, gaussian_taps};
 use std::sync::Arc;
 
 use lightcraft_raster::{Plane, Rgb32f, par_join};
@@ -196,46 +195,20 @@ pub fn normalize_wb(d: &mut DevelopSettings, info: &SourceInfo) {
 
 /// Self-guided filter (He et al.) on a single plane with Gaussian windows of `sigma` px.
 pub fn guided(p: &Plane, sigma: f32, eps: f32) -> Plane {
-    guided_with_blur(p, sigma, eps, Blur::Legacy)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Blur {
-    Legacy,
-    Recursive,
-}
-
-impl Blur {
-    pub fn for_settings(settings: &DevelopSettings) -> Self {
-        match settings.process.process() {
-            Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => Self::Legacy,
-            Process::ForkGaussianV1 => Self::Recursive,
-        }
-    }
-
-    pub fn gaussian<T: Pixel>(self, image: &lightcraft_raster::Image<T>, sigma: f32) -> lightcraft_raster::Image<T> {
-        match self {
-            Self::Legacy => lightcraft_raster::blur::gaussian_box(image, sigma),
-            Self::Recursive => lightcraft_raster::blur::gaussian_recursive(image, sigma),
-        }
-    }
-}
-
-fn guided_with_blur(p: &Plane, sigma: f32, eps: f32, blur: Blur) -> Plane {
-    let (ma, mb) = guided_coeffs(p, sigma, eps, blur);
+    let (ma, mb) = guided_coeffs(p, sigma, eps);
     guided_apply(p, &ma, &mb)
 }
 
 /// Blurred guided-filter coefficients (mean a, mean b) of `p`; every pass row-parallel, and the
 /// two independent blurs of each step run side by side.
-fn guided_coeffs(p: &Plane, sigma: f32, eps: f32, blur: Blur) -> (Plane, Plane) {
-    let (mean, corr) = par_join(|| blur.gaussian(p, sigma), || blur.gaussian(&p.map(|v| v * v), sigma));
+fn guided_coeffs(p: &Plane, sigma: f32, eps: f32) -> (Plane, Plane) {
+    let (mean, corr) = par_join(|| gaussian(p, sigma), || gaussian(&p.map(|v| v * v), sigma));
     let a = corr.zip_map(&mean, |c, m| {
         let var = (c - m * m).max(0.0);
         var / (var + eps)
     });
     let b = mean.zip_map(&a, |m, a| m - a * m);
-    par_join(|| blur.gaussian(&a, sigma), || blur.gaussian(&b, sigma))
+    par_join(|| gaussian(&a, sigma), || gaussian(&b, sigma))
 }
 
 /// `q = a·p + b` per pixel. Reduced coefficients are sampled with the same separable
@@ -299,18 +272,14 @@ fn guided_apply(p: &Plane, a: &Plane, b: &Plane) -> Plane {
 /// sampled bilinearly at full resolution; the output keeps full-resolution edges. Equivalent to [`guided`] for
 /// large windows at a fraction of the cost.
 pub fn guided_fast(p: &Plane, sigma: f32, eps: f32) -> Plane {
-    guided_fast_with_blur(p, sigma, eps, Blur::Legacy)
-}
-
-fn guided_fast_with_blur(p: &Plane, sigma: f32, eps: f32, blur: Blur) -> Plane {
     use lightcraft_raster::resample::{Filter, resize};
     let s = guided_fast_step(sigma);
     if s <= 1 {
-        return guided_with_blur(p, sigma, eps, blur);
+        return guided(p, sigma, eps);
     }
     let (lw, lh) = (p.width.div_ceil(s).max(1), p.height.div_ceil(s).max(1));
     let lo = resize(p, lw, lh, Filter::Box);
-    let (ma, mb) = guided_coeffs(&lo, sigma / s as f32, eps, blur);
+    let (ma, mb) = guided_coeffs(&lo, sigma / s as f32, eps);
     guided_apply(p, &ma, &mb)
 }
 
@@ -406,23 +375,17 @@ pub fn base_detail_radius(px_per_long: f64) -> usize {
 pub fn tone_base_detail(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 => 0,
-        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::ForkGaussianV1 => {
-            base_detail_radius(px_per_long)
-        }
+        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => base_detail_radius(px_per_long),
     }
 }
 
 /// The highlights/shadows base layer of log luminance `l`: the fast guided filter ([`BASE_EPS`])
 /// of its [`median_hv`] at `detail` px ([`tone_base_detail`]); at 0, of `l` itself (V1).
 pub fn tone_base(l: &Plane, sigma: f32, detail: usize) -> Plane {
-    tone_base_with_blur(l, sigma, detail, Blur::Legacy)
-}
-
-fn tone_base_with_blur(l: &Plane, sigma: f32, detail: usize, blur: Blur) -> Plane {
     if detail == 0 {
-        return guided_fast_with_blur(l, sigma, BASE_EPS, blur);
+        return guided_fast(l, sigma, BASE_EPS);
     }
-    guided_fast_with_blur(&median_hv(l, detail), sigma, BASE_EPS, blur)
+    guided_fast(&median_hv(l, detail), sigma, BASE_EPS)
 }
 
 /// Subsampling step of [`guided_fast`] for `sigma` (1 = no subsampling: the plain guided filter).
@@ -452,7 +415,7 @@ pub fn detail_scale(px_per_long: f64, native_long: usize) -> f32 {
     if k.is_finite() { k.clamp(0.0, 1.0) } else { 1.0 }
 }
 
-/// Smallest radius (px) noise reduction filters a preview with: [`lightcraft_raster::blur::gaussian_box`] makes no blur below
+/// Smallest radius (px) noise reduction filters a preview with: [`gaussian`] makes no blur below
 /// about 0.58 px and one 3-px box from there ([`lightcraft_raster::blur::box_sigma`]).
 const NR_MIN_SIGMA: f32 = 1.0;
 
@@ -500,26 +463,22 @@ pub fn nr_params(s: &DevelopSettings, scale: f32) -> (Option<NrLum>, Option<NrCo
 pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, colour_noise: Option<&crate::nrc_joint::JointNoise>) {
     let (lum, col) = nr_params(s, scale);
     if col.is_some() && joint_colour_nr(s) {
-        apply_nr_with_blur(img, lum, None, Blur::for_settings(s));
+        apply_nr(img, lum, None);
         if let Some(p) = nrc_params(s, scale) {
             crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, colour_noise);
         }
         return;
     }
-    apply_nr_with_blur(img, lum, col, Blur::for_settings(s));
+    apply_nr(img, lum, col);
 }
 
 /// Noise reduction with explicit parameters (see [`denoise`]).
 pub fn apply_nr(img: &mut Rgb32f, lum: Option<NrLum>, col: Option<NrColor>) {
-    apply_nr_with_blur(img, lum, col, Blur::Legacy);
-}
-
-fn apply_nr_with_blur(img: &mut Rgb32f, lum: Option<NrLum>, col: Option<NrColor>, blur: Blur) {
     let w = img.width;
     if let Some(nr) = lum {
         let _t = crate::profiling().then(std::time::Instant::now);
         let l = img.map(log_lum);
-        let f = guided_with_blur(&l, nr.sigma, nr.eps, blur);
+        let f = guided(&l, nr.sigma, nr.eps);
         for_rows(&mut img.data, w, |y, row| {
             for (x, p) in row.iter_mut().enumerate() {
                 let i = y * w + x;
@@ -538,7 +497,7 @@ fn apply_nr_with_blur(img: &mut Rgb32f, lum: Option<NrLum>, col: Option<NrColor>
             let y = luminance_2020(c).max(1e-6);
             [c[0] / y, c[1] / y, c[2] / y]
         });
-        let b = blur.gaussian(&chroma, nr.sigma);
+        let b = gaussian(&chroma, nr.sigma);
         for_rows(&mut img.data, w, |y, row| {
             for (x, p) in row.iter_mut().enumerate() {
                 let i = y * w + x;
@@ -825,7 +784,6 @@ pub(crate) fn prepare(
     planes: &mut Planes,
     mattes: Option<&masks::Mattes>,
 ) -> Prepared {
-    let blur = Blur::for_settings(s);
     let log_l = planes.log_l.get_or_insert_with(|| Arc::new(timed("log_l", || img.map(log_lum)))).clone();
     let PlaneSigmas {
         base: base_sigma,
@@ -841,7 +799,7 @@ pub(crate) fn prepare(
     let chroma_blur = chroma_sigma.map(|sg| match sch {
         Some((k, c)) if *k == sg.to_bits() => c.clone(),
         _ => {
-            let c = timed("chroma", || Arc::new(blur.gaussian(&img.map(masks::chromaticity), sg)));
+            let c = timed("chroma", || Arc::new(gaussian(&img.map(masks::chromaticity), sg)));
             *sch = Some((sg.to_bits(), c.clone()));
             c
         }
@@ -851,12 +809,12 @@ pub(crate) fn prepare(
         || base_sigma.map(|sg| plane_at(sb, base_key(s, sg, base_detail), || timed("base", || tone_base(l, sg, base_detail)))),
         || {
             par_join(
-                || clarity_sigma.map(|sg| plane_at(sc, sg.to_bits(), || timed("clarity", || guided_fast_with_blur(l, sg, CLARITY_EPS, blur)))),
+                || clarity_sigma.map(|sg| plane_at(sc, sg.to_bits(), || timed("clarity", || guided_fast(l, sg, CLARITY_EPS)))),
                 || {
                     par_join(
                         || {
                             par_join(
-                                || texture_sigma.map(|sg| plane_at(st, sg.to_bits(), || timed("texture", || blur.gaussian(l, sg)))),
+                                || texture_sigma.map(|sg| plane_at(st, sg.to_bits(), || timed("texture", || gaussian(l, sg)))),
                                 || {
                                     sharpen_sigma_px
                                         .map(|sg| plane_at(ss, sharpen_key(s, sg), || timed("sharpen", || gaussian_taps(l, &gauss_taps(sg)))))
@@ -867,7 +825,7 @@ pub(crate) fn prepare(
                             dark_sigma.map(|sg| match sd {
                                 Some((k, d, air)) if *k == sg.to_bits() => (d.clone(), *air),
                                 _ => {
-                                    let d = timed("dehaze", || Arc::new(blur.gaussian(&img.map(dark_of), sg)));
+                                    let d = timed("dehaze", || Arc::new(gaussian(&img.map(dark_of), sg)));
                                     let air = airlight(&d);
                                     *sd = Some((sg.to_bits(), d.clone(), air));
                                     (d, air)
@@ -895,7 +853,7 @@ pub(crate) fn frame_airlight(src: &Rgb32f, info: &SourceInfo, s: &DevelopSetting
     let mut img = Rgb32f::clone(&frame_proxy(src, frame, proxy_w, proxy_h));
     white_balance(&mut img, info, s);
     let sigma = (0.02 * frame.px_per_long(proxy_w)).max(1.0) as f32;
-    airlight(&Blur::for_settings(s).gaussian(&img.map(dark_of), sigma))
+    airlight(&gaussian(&img.map(dark_of), sigma))
 }
 
 /// How many airlight proxies [`frame_proxy`] keeps (one per photo and frame being zoomed into; each ≤ 1.8 MB).
@@ -1230,7 +1188,7 @@ mod tests {
         let fresh = |src: &Rgb32f, frame: &Frame| {
             let mut img = frame.sample(src, 48, 32);
             white_balance(&mut img, &info, &s);
-            airlight(&Blur::for_settings(&s).gaussian(&img.map(dark_of), (0.02 * frame.px_per_long(48)).max(1.0) as f32))
+            airlight(&gaussian(&img.map(dark_of), (0.02 * frame.px_per_long(48)).max(1.0) as f32))
         };
         let frame = crate::frame_for(&hazy, &info, &s, true);
         let kept = frame_proxy(&hazy, &frame, 48, 32);
@@ -1359,7 +1317,7 @@ mod fast_tests {
             return guided(p, sigma, eps);
         }
         let lo = resize(p, p.width.div_ceil(s).max(1), p.height.div_ceil(s).max(1), Filter::Box);
-        let (a, b) = guided_coeffs(&lo, sigma / s as f32, eps, Blur::Legacy);
+        let (a, b) = guided_coeffs(&lo, sigma / s as f32, eps);
         let (a, b) = (resize(&a, p.width, p.height, Filter::Bilinear), resize(&b, p.width, p.height, Filter::Bilinear));
         Plane::from_fn(p.width, p.height, |x, y| a.get(x, y) * p.get(x, y) + b.get(x, y))
     }

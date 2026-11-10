@@ -310,19 +310,6 @@ real failure still stops the whole process. Such a test asserts on its own rende
 `last_fallback()`, so it can run beside other tests rendering on the GPU (issue #675).
 
 ## Correctness: CPU oracle and equivalence tests
-Process V5 (#176) changes the CPU Gaussian to the shared variance-calibrated recursive filter;
-**GPU keeps its three-box path and #28 scan unchanged**. It is now an approximation to the V5 CPU,
-not a matching recursive implementation. V1–V4 retain their previous box blur on both paths.
-The ordinary V5 render tests allow mean |Δ| < **1 LSB**, max |Δ| ≤ **32 LSB**;
-measured maxima on Metal are 0.5456 mean LSB and 32 max LSB (different cases).
-Sharpening diagnostic views amplify the differing detail windows: mean < 2 LSB and
-at most 5% of pixels differing by more than 8 LSB (measured 1.5468 and 4.4017%).
-Proof warnings are binary thresholds: up to 0.3% boundary flips / warned-pixel count
-difference under V5, versus 0.01% under V1–V4. Kernel tests still compare against
-`gaussian_box` with their original tight tolerance. V1–V4 keep the original render
-bounds below. A later ticket ports the Nehab block-parallel recursive filter to WGSL;
-these V5 bounds do not establish Lightroom fidelity. See [recursive-gaussian.md](recursive-gaussian.md).
-
 `crates/gpu/tests/it/equivalence.rs` renders the same settings on both and compares 8-bit sRGB:
 bounds **mean |Δ| < 0.5 LSB and max |Δ| ≤ 3 LSB** per channel. Measured (Apple M4 Pro, Metal):
 **max 1 LSB, mean ≤ 0.0003 LSB** for every case — 26 settings cases (all tone/colour/effects tools,

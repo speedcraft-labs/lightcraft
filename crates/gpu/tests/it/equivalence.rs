@@ -2,9 +2,7 @@
 //! `lightcraft_gpu::render`, compared in 8-bit sRGB.
 //!
 //! Bounds (documented in `docs/gpu-pipeline.md`): mean |Δ| < 0.5 LSB and max |Δ| ≤ 3 LSB per
-//! channel for upstream V1–V7. ForkGaussianV1 CPU uses the shared recursive Gaussian, while GPU retains the
-//! three-box approximation (#176); its bounds are measured separately below.
-//! Skips (passes with a note) when no GPU adapter exists;
+//! channel for every case. Skips (passes with a note) when no GPU adapter exists;
 //! `LIGHTCRAFT_GPU_ALLOW_SOFTWARE=1` runs them on a software adapter (lavapipe, WARP) instead.
 
 use std::sync::Arc;
@@ -21,17 +19,6 @@ const MAX_LSB: u8 = 3;
 /// Float renders have no dither to allow for: the bounds of [`check_hdr`], in 8-bit steps.
 const HDR_MEAN_STEPS: f64 = 0.02;
 const HDR_MAX_STEPS: f64 = 1.0;
-
-fn bounds(settings: &DevelopSettings) -> (f64, u8) {
-    match settings.process.process() {
-        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => (MEAN_LSB, MAX_LSB),
-        Process::ForkGaussianV1 => (1.0, 32),
-    }
-}
-
-fn uses_recursive_gaussian(settings: &DevelopSettings) -> bool {
-    settings.process.process() == Process::ForkGaussianV1
-}
 
 fn gpu() -> bool {
     let ok = lightcraft_gpu::available();
@@ -145,9 +132,8 @@ fn check(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, 
     let cpu = render(src, info, s, req).image;
     let gpu = lightcraft_gpu::render(src, info, s, req, None).expect("gpu render");
     let (mean, max, over) = diff(&cpu, &gpu.image);
-    let (mean_bound, max_bound) = bounds(s);
     eprintln!("{name:<28} {}x{}  mean {mean:.4}  max {max}  >1: {:.4}%", cpu.width, cpu.height, over * 100.0);
-    assert!(mean < mean_bound && max <= max_bound, "{name}: mean {mean:.4} LSB, max {max} LSB");
+    assert!(mean < MEAN_LSB && max <= MAX_LSB, "{name}: mean {mean:.4} LSB, max {max} LSB");
     (mean, max)
 }
 
@@ -158,12 +144,10 @@ fn check_warned(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSet
     let cpu = render(src, info, s, req).image;
     let gpu = lightcraft_gpu::render(src, info, s, req, None).expect("gpu render");
     let (mean, _, over) = diff(&cpu, &gpu.image);
-    let (mean_bound, max_bound) = bounds(s);
-    let flips = cpu.data.iter().zip(&gpu.image.data).filter(|(p, q)| (0..3).any(|c| p[c].abs_diff(q[c]) > max_bound)).count();
+    let flips = cpu.data.iter().zip(&gpu.image.data).filter(|(p, q)| (0..3).any(|c| p[c].abs_diff(q[c]) > MAX_LSB)).count();
     let share = flips as f64 / cpu.data.len() as f64;
     eprintln!("{name:<28} {}x{}  mean {mean:.4}  >1: {:.4}%  boundary flips {flips}", cpu.width, cpu.height, over * 100.0);
-    let flip_bound = if uses_recursive_gaussian(s) { 0.003 } else { 1e-4 };
-    assert!(mean < mean_bound && share <= flip_bound, "{name}: mean {mean:.4} LSB, {flips} pixels differ by more than {max_bound} LSB");
+    assert!(mean < MEAN_LSB && share <= 1e-4, "{name}: mean {mean:.4} LSB, {flips} pixels differ by more than {MAX_LSB} LSB");
 }
 
 type Edit = fn(&mut DevelopSettings);
@@ -977,8 +961,7 @@ fn overlays_match() {
                 let (mean, max, _) = diff(&cpu, &gpu);
                 let far = cpu.data.iter().zip(&gpu.data).filter(|(a, b)| a[0].abs_diff(b[0]) > 8).count() as f64 / cpu.data.len() as f64;
                 eprintln!("{o:?} sharpen {amount:<4}  mean {mean:.4}  max {max}  >8: {:.4}%", far * 100.0);
-                let (mean_bound, far_bound) = if uses_recursive_gaussian(&s) { (2.0, 0.05) } else { (1.0, 0.005) };
-                assert!(mean < mean_bound && far < far_bound, "{o:?} sharpen {amount}: mean {mean:.4}, >8 LSB {far}");
+                assert!(mean < 1.0 && far < 0.005, "{o:?} sharpen {amount}: mean {mean:.4}, >8 LSB {far}");
             }
         }
     }
@@ -1425,8 +1408,7 @@ fn soft_proofs_match() {
     let (cpu, gpu) = (render(&src, &raw, &s, &req).image, lightcraft_gpu::render(&src, &raw, &s, &req, None).expect("gpu render").image);
     assert!(warned(&cpu) > 100, "{} warned pixels", warned(&cpu));
     let (a, b) = (warned(&cpu), warned(&gpu));
-    let warning_bound = if uses_recursive_gaussian(&s) { 0.003 } else { 1e-4 };
-    assert!(a.abs_diff(b) as f64 <= warning_bound * cpu.data.len() as f64, "warned pixels: CPU {a}, GPU {b}");
+    assert!(a.abs_diff(b) as f64 <= 1e-4 * cpu.data.len() as f64, "warned pixels: CPU {a}, GPU {b}");
     // an output-device profile (a 3D table) stays on the CPU
     let n = 2;
     let lut = lightcraft_pipeline::ProofLut::new(n, vec![[0.5, 0.5, 0.5, 0.0]; n * n * n]).unwrap();

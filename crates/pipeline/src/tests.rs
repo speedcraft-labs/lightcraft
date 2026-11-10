@@ -277,50 +277,6 @@ fn stage_cache_matches_uncached_render_through_a_slider_session() {
 }
 
 #[test]
-fn process_switch_rebuilds_recursive_blur_stages() {
-    use crate::{Quality, StageCache, local::Blur, render_cached};
-    use lightcraft_develop::{Mask, MaskComponent, MaskOp, MaskShape, Process, Spot, SpotMode};
-    use lightcraft_geom::Point;
-    use std::sync::Arc;
-
-    let src = Arc::new(scene());
-    let info = SourceInfo { raw: true, ..Default::default() };
-    let cache = StageCache::default();
-    let mut settings = typical_edits();
-    settings.spots.push(Spot {
-        mode: SpotMode::Heal,
-        points: vec![Point::new(0.4, 0.5)],
-        source_offset: Some(Point::new(0.2, 0.0)),
-        ..Default::default()
-    });
-    settings.masks.push(Mask {
-        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape: MaskShape::Subject }],
-        adjust: lightcraft_develop::LocalAdjustments { clarity: 20.0, exposure: 0.3, ..Default::default() },
-        ..Default::default()
-    });
-    let probe = lightcraft_raster::Plane::from_fn(65, 1, |index, _| f32::from(index == 32));
-    let legacy = lightcraft_raster::blur::gaussian_box(&probe, 1.0);
-    let current = lightcraft_raster::blur::gaussian_recursive(&probe, 1.0);
-    assert_ne!(legacy, current);
-    for request in [RenderRequest::fit(160, 120), RenderRequest { quality: Quality::Draft, ..RenderRequest::fit(120, 80) }] {
-        let mut versions = Vec::new();
-        for process in [Process::V1, Process::V2, Process::V3, Process::V4, Process::ForkGaussianV1, Process::V4, Process::V1] {
-            settings.process = process.version();
-            assert_eq!(
-                Blur::for_settings(&settings).gaussian(&probe, 1.0),
-                if process == Process::ForkGaussianV1 { &current } else { &legacy }.clone()
-            );
-            let cached = render_cached(&src, &info, &settings, &request, &cache).image;
-            assert_eq!(cached, render(&src, &info, &settings, &request).image, "{process:?} {:?}", request.quality);
-            versions.push(cached);
-        }
-        assert_ne!(versions[3], versions[4]);
-        assert_eq!(versions[0], versions[6]);
-        assert_eq!(versions[3], versions[5], "switching back from ForkGaussianV1 restores V4 output");
-    }
-}
-
-#[test]
 fn drafts_keep_wide_planes_across_a_noise_reduction_change_and_full_renders_do_not() {
     use crate::{Quality, StageCache, render_cached};
     use std::sync::Arc;

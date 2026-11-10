@@ -115,11 +115,15 @@ extra field and retain their existing cached renders. No cache-version bump is n
 | 2026-11-05 | minor | V5: a raw's tone curve rolls off into white in stops, so raising Exposure keeps recorded highlights (#1632) |
 | 2026-10-12 | minor | Calibrated Contrast and Blacks, V2 Whites, resolved-process cache keys and number coordination |
 
-## Fork render namespace (sync #312)
+## Fork render policy (sync #312)
 
-Ordinary process numbers belong to upstream. `ForkGaussianV1` uses `2147483649`
-(`0x80000001`, high bit set) for V7 plus the recursive CPU Gaussian described in
-[recursive Gaussian](recursive-gaussian.md). Upstream V1–V7 keep upstream
-semantics. Existing fork-only V5 fixtures/benchmark outputs are disposable and
-regenerated; no migration path is provided. Keep future fork render variants
-in this namespace instead of allocating the next upstream integer.
+Ordinary process numbers belong to upstream. V1–V7, including V5's highlight
+roll-off, retain upstream rendering. The fork's old process 5 meant a different
+Gaussian; its files are disposable test/benchmark data and have no migration.
+
+A reapplication in the separate high-bit namespace (`0x80000001`) was tested,
+but its CPU recursive Gaussian did not match the GPU box approximation within
+upstream's HDR bounds. That render change is withheld from this sync; new
+settings use upstream V7. Existing upstream fixtures and parity bounds are kept.
+See [the recorded attempt](recursive-gaussian.md). Any future fork render variant
+must use the high-bit namespace and prove CPU/GPU parity before becoming default.

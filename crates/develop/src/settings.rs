@@ -71,9 +71,7 @@ impl ProcessVersion {
 
     /// Older than [`Self::LATEST`]: Update to Current Process applies.
     pub fn is_outdated(self) -> bool {
-        // Unknown future upstream versions stay in the upstream namespace; do not
-        // offer an update that would reinterpret them as a fork render version.
-        self.0 <= Process::V7.version().0 || (self.0 >= 0x8000_0000 && self < ProcessVersion::LATEST)
+        self < ProcessVersion::LATEST
     }
 }
 
@@ -101,16 +99,12 @@ pub enum Process {
     /// V6, with film grain from a stack of crystal layers (after Aurélien Pierre's model): resolution
     /// independent, fading out at black and white; V1 to V6 keep their value noise.
     V7,
-    /// Fork namespace (high bit set): upstream V7 plus variance-calibrated recursive CPU Gaussian.
-    /// Ordinary upstream process numbers remain reserved for upstream; never reuse them here.
-    ForkGaussianV1,
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 8] =
-        [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::ForkGaussianV1];
-    pub const LATEST: Process = Process::ForkGaussianV1;
+    pub const ALL: [Process; 7] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7];
+    pub const LATEST: Process = Process::V7;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -121,7 +115,6 @@ impl Process {
             Process::V5 => ProcessVersion(5),
             Process::V6 => ProcessVersion(6),
             Process::V7 => ProcessVersion(7),
-            Process::ForkGaussianV1 => ProcessVersion(0x8000_0001),
         }
     }
 }

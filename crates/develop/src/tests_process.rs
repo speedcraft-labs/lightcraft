@@ -79,13 +79,11 @@ fn v1_is_left_out_when_saving_and_other_processes_are_kept() {
     let mut s = DevelopSettings::from_json(&legacy()).unwrap();
     assert!(s.to_json().get("process").is_none());
     let before = s.hash64();
-    for process in [Process::V2, Process::V3] {
-        s.process = process.version();
-        let v = s.to_json();
-        assert_eq!(v["process"], json!(process.version().0));
-        assert_eq!(DevelopSettings::from_json(&v).unwrap().process, process.version());
-        assert_ne!(s.hash64(), before, "another process is another preview");
-    }
+    s.process = ProcessVersion(2);
+    let v = s.to_json();
+    assert_eq!(v["process"], json!(2));
+    assert_eq!(DevelopSettings::from_json(&v).unwrap().process, ProcessVersion(2));
+    assert_ne!(s.hash64(), before, "another process is another preview");
 }
 
 #[test]
@@ -163,21 +161,3 @@ fn the_process_is_not_an_edit_nor_part_of_copied_settings() {
 
 /// A process other than the latest: a newer LightCraft's number (no older one than V1 exists).
 const LATEST_PLUS_ONE: u32 = ProcessVersion::LATEST.0 + 1;
-
-#[test]
-fn fork_gaussian_uses_a_separate_namespace_and_upstream_v5_stays_upstream() {
-    assert_eq!(ProcessVersion(5).process(), Process::V5);
-    assert_eq!(ProcessVersion(6).process(), Process::V6);
-    assert_eq!(ProcessVersion(7).process(), Process::V7);
-    let fork = Process::ForkGaussianV1.version();
-    assert_eq!(fork.0, 0x8000_0001);
-    assert_eq!(fork.process(), Process::ForkGaussianV1);
-    let settings = DevelopSettings { process: fork, ..Default::default() };
-    assert_eq!(settings.to_json()["process"], json!(2147483649u32));
-    assert_eq!(DevelopSettings::from_json(&settings.to_json()).unwrap().process, fork);
-    for future_upstream in [8, 99, 0x7fff_ffff] {
-        let version = ProcessVersion(future_upstream);
-        assert_eq!(version.process(), Process::V7);
-        assert!(!version.is_outdated(), "never reinterpret a future upstream number as a fork version");
-    }
-}

@@ -522,7 +522,6 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         // and the local tone mapping
         local_tone::enabled(info, s),
         src_long,
-        local::Blur::for_settings(s) == local::Blur::Recursive,
     ));
     let lin_key = hash_of((
         pre_nr_key,
@@ -617,7 +616,7 @@ pub fn lin_cpu(img: &mut Rgb32f, info: &SourceInfo, p: &Plan<'_>) {
     local_tone::apply(img, info, p);
     local::white_balance(img, info, s);
     optics::defringe(img, s, p.px_per_long / optics::DEFRINGE_REF_LONG);
-    spots::apply_with_blur(img, &s.spots, &p.frame, p.px_per_long, local::Blur::for_settings(s));
+    spots::apply(img, &s.spots, &p.frame, p.px_per_long);
     redeye::apply(img, &p.eyes);
 }
 
@@ -826,17 +825,7 @@ fn overlay_alpha(o: Overlay, plan: &Plan<'_>, prep: &Prepared) -> Option<Plane> 
         return Some(e.alpha.clone());
     }
     let ev = plan.settings.light.exposure as f32;
-    Some(masks::evaluate_one_with_blur(
-        m,
-        &plan.frame,
-        plan.w,
-        plan.h,
-        &prep.img,
-        &prep.log_l,
-        ev,
-        plan.mattes.as_deref(),
-        local::Blur::for_settings(&plan.settings),
-    ))
+    Some(masks::evaluate_one(m, &plan.frame, plan.w, plan.h, &prep.img, &prep.log_l, ev, plan.mattes.as_deref()))
 }
 
 /// The alpha planes an `Overlay::AllMasks` shows: one per visible mask that has components,
@@ -851,17 +840,7 @@ fn overlay_alphas_all(o: Overlay, plan: &Plan<'_>, prep: &Prepared) -> Option<Ve
         if let Some(e) = prep.masks.iter().find(|e| e.id == m.id) {
             out.push(e.alpha.clone());
         } else {
-            out.push(masks::evaluate_one_with_blur(
-                m,
-                &plan.frame,
-                plan.w,
-                plan.h,
-                &prep.img,
-                &prep.log_l,
-                ev,
-                plan.mattes.as_deref(),
-                local::Blur::for_settings(&plan.settings),
-            ));
+            out.push(masks::evaluate_one(m, &plan.frame, plan.w, plan.h, &prep.img, &prep.log_l, ev, plan.mattes.as_deref()));
         }
     }
     Some(out)
