@@ -28,6 +28,7 @@ const FRAMES: Duration = Duration::from_secs(15);
 struct Drive {
     open: Arc<AtomicBool>,
     reads: Arc<AtomicUsize>,
+    other_reads: Arc<AtomicUsize>,
     on_ui: Arc<AtomicUsize>,
 }
 
@@ -43,14 +44,22 @@ fn app_on_a_slow_drive_in_view(guard: Duration, view: ViewMode) -> (Headless, Dr
         let p = Photo::new(PhotoId(i + 1), Source::File { path }, &format!("IMG_{i:04}.arw"), "ARW", 64, 64, "2026-01-01T00:00:00");
         app.session.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
     }
-    let drive = Drive { open: Arc::new(AtomicBool::new(false)), reads: Arc::new(AtomicUsize::new(0)), on_ui: Arc::new(AtomicUsize::new(0)) };
-    let (ui, open, reads, on_ui) = (std::thread::current().id(), drive.open.clone(), drive.reads.clone(), drive.on_ui.clone());
+    let drive = Drive {
+        open: Arc::new(AtomicBool::new(false)),
+        reads: Arc::new(AtomicUsize::new(0)),
+        other_reads: Arc::new(AtomicUsize::new(0)),
+        on_ui: Arc::new(AtomicUsize::new(0)),
+    };
+    let (ui, open, reads, other_reads, on_ui) =
+        (std::thread::current().id(), drive.open.clone(), drive.reads.clone(), drive.other_reads.clone(), drive.on_ui.clone());
     let deadline = Instant::now() + guard;
     app.session.media.file_loader = Some(Arc::new(move |path: &str, _, _| {
         // (the grid reads the photos for its thumbnails too, on threads of its own)
         let thread = std::thread::current();
         if thread.name().is_some_and(|n| n.starts_with("similar-") || n.contains(LABEL)) {
             reads.fetch_add(1, Ordering::SeqCst);
+        } else {
+            other_reads.fetch_add(1, Ordering::SeqCst);
         }
         if thread.id() == ui {
             on_ui.fetch_add(1, Ordering::SeqCst);
@@ -158,6 +167,10 @@ fn a_second_search_waits_for_the_first() {
 fn stopping_leaves_the_view_alone_and_the_next_search_reads_only_the_rest() {
     // Start in Detail before the first frame so grid thumbnail decodes can't race the read count.
     let (mut h, drive) = app_on_a_slow_drive_in_view(GUARD, ViewMode::Detail);
+    // Detail still draws filmstrip thumbnails. They can populate the source cache between
+    // searches, so worker file-read counts depend on scheduling unless the strip is hidden.
+    h.app.ui.filmstrip = false;
+    assert!(h.app.session.active().is_none(), "this fixture must not start a loupe render either");
     h.app.run("library.findSimilar", json!({"id": 1})).unwrap();
     // stopped while the searched photo is being read: that one read is all it does
     assert!(h.step_until(T, |_| drive.reads.load(Ordering::SeqCst) == 1), "the first read never started");
@@ -169,6 +182,7 @@ fn stopping_leaves_the_view_alone_and_the_next_search_reads_only_the_rest() {
     assert_eq!(h.app.ui.view, ViewMode::Detail);
     assert!(h.app.ui.toast.is_none(), "{:?}", h.app.ui.toast);
     assert_eq!(drive.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(drive.other_reads.load(Ordering::SeqCst), 0, "only the search may populate this fixture's source cache");
 
     let r = h.app.run("library.findSimilar", json!({"id": 1})).unwrap();
     assert_eq!(r["count"], PHOTOS - 1, "what was read isn't read again");
