@@ -392,15 +392,18 @@ NR stage 1.5 → 0.4 s and spatial planes 0.89 → 0.29 s (`LIGHTCRAFT_PROFILE`)
 GPU timings include the readback of the 8-bit result and the histogram. Device creation + kernel
 compilation: ~0.4 s once per process — the desktop app starts it on a background thread at launch
 (`lightcraft_gpu::warm_up`), so the first loupe render doesn't wait for it; other processes create
-the device on their first GPU render. `lightcraft_gpu::ready()` asks without blocking.
+the device on their first GPU render. Radius-specialized median kernels compile only when a median
+filter of that radius is first used; ordinary photo opens don't pay for unused radii.
+`lightcraft_gpu::ready()` asks without blocking.
 
 On Windows / DX12 the kernels cost more: FXC compiles each pipeline single-threaded inside
 `create_compute_pipeline` (issue #471). Built one after another, the 27 took ~2.2 s on an Intel Core
 Ultra 7 165U iGPU (`app.gpu` 2.4 s median, up to 7 s on the first run after an install), so
 `ctx::build_kernels` shares them out to worker threads (issue #2936): ~1.05 s there (`app.gpu` 1.2 s),
 most likely the largest kernel (`finish.wgsl`) alone (not timed per kernel). wgpu's error scopes are per thread, so every worker
-opens its own; a refused kernel still means no GPU. The `gpu:` info log line gives the kernel count
-and build time.
+opens its own; a refused baseline kernel still means no GPU. Specialized median kernels are built
+on demand and fall back to the generic median kernels if a driver refuses one. The `gpu:` info log
+line gives the baseline kernel count and build time.
 
 ## Drawing renders straight from the GPU
 The desktop app creates the window's wgpu device with the adapter's limits and hands it to the GPU

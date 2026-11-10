@@ -384,11 +384,7 @@ fn median_hv(cx: &mut Cx<'_>, p: &Buf, w: usize, h: usize, r: usize) -> Buf {
     }
     let pr = [w as u32, h as u32, 1, r.min(local::BASE_DETAIL_MAX) as u32];
     let tmp = cx.gpu.buffer(w * h);
-    let (horizontal, vertical) = crate::ctx::MEDIAN_NETWORKS
-        .get(r - 1)
-        .copied()
-        .filter(|(horizontal, vertical)| cx.gpu.has_kernel(horizontal) && cx.gpu.has_kernel(vertical))
-        .unwrap_or(("median_h", "median_v"));
+    let (horizontal, vertical) = if cx.gpu.ensure_median_kernels(r) { crate::ctx::MEDIAN_NETWORKS[r - 1] } else { ("median_h", "median_v") };
     cx.run(horizontal, &pr, &[Some(p), Some(&tmp)], groups2(w, h, [16, 16]));
     let out = cx.gpu.buffer(w * h);
     cx.run(vertical, &pr, &[Some(&tmp), Some(&out)], groups2(w, h, [16, 16]));
@@ -1839,7 +1835,9 @@ mod tests {
         let _scope = crate::ctx::RenderScope::new(gpu);
         let mut cx = Cx::new(gpu);
         let values = [0xffc00012, 0xff800000, 0xbf800000, 0x80000000, 0, 0x3f800000, 0x7f800000, 0x7fc00012];
-        for (horizontal, vertical) in crate::ctx::MEDIAN_NETWORKS {
+        for (index, (horizontal, vertical)) in crate::ctx::MEDIAN_NETWORKS.iter().copied().enumerate() {
+            let radius = index + 1;
+            assert!(gpu.ensure_median_kernels(radius), "network failed to compile: {horizontal}, {vertical}");
             assert!(gpu.has_kernel(horizontal) && gpu.has_kernel(vertical), "network unavailable: {horizontal}, {vertical}");
         }
         for (w, h) in [(1, 1), (3, 2), (17, 19), (32, 7), (49, 5)] {
@@ -1951,6 +1949,7 @@ mod tests {
         let mut cx = Cx::new(gpu);
         eprintln!("median benchmark: {} ({:?})", gpu.info.name, gpu.info.backend);
         for r in [2, 8, 24] {
+            assert!(gpu.ensure_median_kernels(r), "network failed to compile for radius {r}");
             let params = [w as u32, h as u32, 1, r as u32];
             let groups = groups2(w, h, [16, 16]);
             let old_tmp = gpu.buffer(w * h);
@@ -2103,6 +2102,7 @@ mod tests {
         let old_out = gpu.buffer(w * h);
         let new_tmp = gpu.buffer(w * h);
         let new_out = gpu.buffer(w * h);
+        assert!(gpu.ensure_median_kernels(radius), "network failed to compile for radius {radius}");
         let (new_horizontal, new_vertical) = crate::ctx::MEDIAN_NETWORKS[radius - 1];
         let mut old_ms = [0.0f64; 10];
         let mut new_ms = [0.0f64; 10];

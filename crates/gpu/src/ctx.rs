@@ -1,6 +1,7 @@
 //! The wgpu device, the compiled kernels, buffers, dispatch and readback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// A kernel module: WGSL source, its storage bindings (name, writable, element type) after the
@@ -158,8 +159,9 @@ fn pop_scopes(scopes: [wgpu::ErrorScopeGuard; 2]) -> Option<String> {
     internal.or(validation).map(|e| e.to_string())
 }
 
-/// Build every kernel. A kernel the driver's compiler refuses is a validation or an internal error,
-/// and then there is no GPU, not a half-built one.
+/// Build the baseline kernels. Radius-specialized median kernels are compiled when first used.
+/// A baseline kernel the driver's compiler refuses is a validation or an internal error, and then
+/// there is no GPU, not a half-built one.
 ///
 /// Issue #2936: built one after another, the 27 pipelines took ~2.2 s on an Intel iGPU under DX12
 /// (device start-up 1.7–4.4 s in all, 7 s on the first run after an install), where FXC (issue #471)
@@ -211,34 +213,6 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
     Ok(built.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
-/// The optional median pair for one radius, sharing the generic blur binding layout.
-fn build_median_pair(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, radius: usize) -> Result<(Kernel, Kernel), String> {
-    let &(horizontal, vertical) = MEDIAN_NETWORKS.get(radius.checked_sub(1).ok_or("unknown median radius")?).ok_or("unknown median radius")?;
-    let blur = &MODULES[1];
-    let scopes = push_scopes(device);
-    let source = format!("{}{}", module_source(blur, &constants()), median_network_source(radius));
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(source.into()) });
-    let pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(layout)], immediate_size: 0 });
-    let make = |name| Kernel {
-        pipeline: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(name),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some(name),
-            compilation_options: Default::default(),
-            cache: None,
-        }),
-        layout: layout.clone(),
-        nbuf: blur.bindings.len(),
-    };
-    let pair = (make(horizontal), make(vertical));
-    match pop_scopes(scopes) {
-        Some(error) => Err(error),
-        None => Ok(pair),
-    }
-}
-
 /// One worker of [`build_kernels`]: build kernels until none is left; the first error its scopes caught.
 fn build_jobs(
     device: &wgpu::Device,
@@ -267,6 +241,43 @@ fn build_jobs(
         }
     }
     error
+}
+
+/// Build the specialized horizontal and vertical median kernels for one radius. Failures leave the
+/// generic median kernels available as a fallback.
+fn build_median_kernels(device: &wgpu::Device, radius: usize) -> Option<[(&'static str, Kernel); 2]> {
+    let &(horizontal, vertical) = MEDIAN_NETWORKS.get(radius.checked_sub(1)?)?;
+    let blur = &MODULES[1];
+    let scopes = push_scopes(device);
+    let source = format!("{}{}", module_source(blur, &constants()), median_network_source(radius));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(source.into()) });
+    let mut entries = vec![storage_entry(0, true)];
+    entries.extend(blur.bindings.iter().enumerate().map(|(i, (_, writable, _))| storage_entry(i as u32 + 1, !writable)));
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+    let pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+    if pop_scopes(scopes).is_some() {
+        return None;
+    }
+
+    let mut built = Vec::with_capacity(2);
+    for entry in [horizontal, vertical] {
+        let scopes = push_scopes(device);
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if pop_scopes(scopes).is_some() {
+            return None;
+        }
+        built.push((entry, Kernel { pipeline, layout: layout.clone(), nbuf: blur.bindings.len() }));
+    }
+    let mut built = built.into_iter();
+    Some([built.next()?, built.next()?])
 }
 
 /// A device buffer of `len` 32-bit values.
@@ -439,9 +450,8 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
-    // One cache for eager upstream kernels and lazily built optional median pairs.
-    // None remembers a rejected optional kernel so later frames keep the generic fallback.
-    kernels: std::sync::Mutex<HashMap<&'static str, Option<Kernel>>>,
+    kernels: RwLock<HashMap<&'static str, Kernel>>,
+    median_failed: std::sync::Mutex<HashSet<usize>>,
     dummy: wgpu::Buffer,
     /// Recycled buffers (see [`Buf`]).
     free: std::sync::Mutex<Vec<Tracked>>,
@@ -602,27 +612,40 @@ fn median_network_source(radius: usize) -> String {
 }
 
 impl Gpu {
+    #[cfg(test)]
     pub(crate) fn has_kernel(&self, name: &str) -> bool {
-        self.kernel(name).is_some()
+        self.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(name)
     }
 
-    fn kernel(&self, name: &str) -> Option<Kernel> {
-        let mut kernels = self.kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(kernel) = kernels.get(name) {
-            return kernel.clone();
+    /// Compile a radius-specific median pair on first use. The write lock keeps concurrent first
+    /// renders from compiling the same pair more than once.
+    pub(crate) fn ensure_median_kernels(&self, radius: usize) -> bool {
+        let Some(&(horizontal, vertical)) = radius.checked_sub(1).and_then(|index| MEDIAN_NETWORKS.get(index)) else {
+            return false;
+        };
+        {
+            let kernels = self.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if kernels.contains_key(horizontal) && kernels.contains_key(vertical) {
+                return true;
+            }
         }
-        let radius = MEDIAN_NETWORKS.iter().position(|&(h, v)| name == h || name == v)? + 1;
-        let (horizontal, vertical) = MEDIAN_NETWORKS[radius - 1];
-        // Device creation must not compile all 48 optional sorting-network pipelines: the
-        // NVIDIA compiler takes minutes, delaying startup and timing out device-loss tests.
-        // Compile only the requested radius, once; a refusal keeps upstream's generic median.
-        let pair = kernels.get("median_h").and_then(Option::as_ref).and_then(|base| {
-            build_median_pair(&self.device, &base.layout, radius).map_err(|e| log::warn!("gpu: median radius {radius} unavailable: {e}")).ok()
-        });
-        let (h, v) = pair.map_or((None, None), |(h, v)| (Some(h), Some(v)));
-        kernels.insert(horizontal, h);
-        kernels.insert(vertical, v);
-        kernels.get(name).cloned().flatten()
+        let mut kernels = self.kernels.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kernels.contains_key(horizontal) && kernels.contains_key(vertical) {
+            return true;
+        }
+        let failed = self.median_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failed.contains(&radius) {
+            return false;
+        }
+        drop(failed);
+        let Some(built) = build_median_kernels(&self.device, radius) else {
+            self.median_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(radius);
+            return false;
+        };
+        for (name, kernel) in built {
+            kernels.insert(name, kernel);
+        }
+        true
     }
 
     /// Create a device on the best available adapter (no software adapter unless
@@ -722,12 +745,12 @@ impl Gpu {
             device,
             queue,
             info,
-            kernels: std::sync::Mutex::new(kernels.into_iter().map(|(name, kernel)| (name, Some(kernel))).collect()),
+            kernels: RwLock::new(kernels),
+            median_failed: Default::default(),
             dummy,
             free: Default::default(),
             max_buffer,
             window,
-            grain: Default::default(),
         })
     }
 
@@ -971,7 +994,8 @@ impl Gpu {
         if failed() {
             return; // the render is redone on the CPU: don't spend the GPU on it
         }
-        let Some(k) = self.kernel(name) else {
+        let kernels = self.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(k) = kernels.get(name) else {
             // a kernel name typo: fail this render over to the CPU instead of crashing
             fail(FailKind::Fatal, format!("unknown kernel {name}"));
             return;
@@ -1440,9 +1464,10 @@ mod tests {
             return;
         };
         let entries: Vec<&str> = super::MODULES.iter().flat_map(|m| m.entries.iter().copied()).collect();
-        assert!(g.kernels.lock().unwrap().len() >= entries.len());
+        let kernels = g.kernels.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(kernels.len() >= entries.len());
         for e in entries {
-            assert!(g.has_kernel(e), "no kernel for {e}");
+            assert!(kernels.contains_key(e), "no kernel for {e}");
         }
     }
 
@@ -1498,12 +1523,13 @@ mod tests {
             println!("CHILD: no GPU");
             return;
         };
-        let optional = || gpu.kernels.lock().unwrap().keys().filter(|name| name.starts_with("median_h_") || name.starts_with("median_v_")).count();
+        let optional = || gpu.kernels.read().unwrap().keys().filter(|name| name.starts_with("median_h_") || name.starts_with("median_v_")).count();
         assert_eq!(optional(), 0, "startup must not compile radius-specific sorting networks");
         let (h, v) = super::MEDIAN_NETWORKS[0];
+        assert!(gpu.ensure_median_kernels(1));
         assert!(gpu.has_kernel(h) && gpu.has_kernel(v));
         assert_eq!(optional(), 2, "only the requested pair is compiled and cached");
-        assert!(gpu.has_kernel(h));
+        assert!(gpu.ensure_median_kernels(1) && gpu.has_kernel(h));
         assert_eq!(optional(), 2, "the cached pair is reused");
         println!("CHILD: survived");
     }
