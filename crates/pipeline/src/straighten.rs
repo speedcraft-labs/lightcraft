@@ -105,7 +105,7 @@ fn plumb_roll(vertical: &[Segment]) -> Option<f64> {
 /// The crop angle that levels the horizon of `lum`, if it has one: the straight line across the
 /// width along which the rows above are brighter (or darker) than those below in most columns.
 fn horizon(lum: &Plane) -> Option<f64> {
-    let img = lightcraft_raster::blur::gaussian_box(lum, HORIZON_SIGMA);
+    let img = lightcraft_raster::blur::gaussian(lum, HORIZON_SIGMA);
     let (w, h) = (img.width, img.height);
     let k = HORIZON_ROWS;
     if w < 32 || h < 4 * k + 8 || img.data.len() < w * h {

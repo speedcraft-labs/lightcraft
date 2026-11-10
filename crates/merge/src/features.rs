@@ -15,11 +15,9 @@
 //!   variance (bias/gain invariant) — 64 floats.
 //! - **Matching:** brute-force nearest neighbour in L2 with Lowe's ratio test, kept only when
 //!   mutually consistent.
-//!
-//! The detector's tuned scales retain legacy box windows independently of develop-process blur.
 
 use lightcraft_raster::Plane;
-use lightcraft_raster::blur::gaussian_box;
+use lightcraft_raster::blur::gaussian;
 use lightcraft_raster::resample::half;
 use rayon::prelude::*;
 
@@ -67,8 +65,8 @@ pub fn detect(img: &Plane, max: usize) -> Features {
         .enumerate()
         .map(|(li, lvl)| {
             let cands = harris(lvl);
-            let orient_img = gaussian_box(lvl, 4.5);
-            let desc_img = gaussian_box(lvl, 2.5);
+            let orient_img = gaussian(lvl, 4.5);
+            let desc_img = gaussian(lvl, 2.5);
             let (gx, gy) = gradients(&orient_img);
             let scale = (1u32 << li) as f32;
             let mut pts = Vec::new();
@@ -109,11 +107,11 @@ fn harris(lvl: &Plane) -> Vec<(f32, f32, f32)> {
     if w < 24 || h < 24 {
         return vec![];
     }
-    let s = gaussian_box(lvl, 1.0);
+    let s = gaussian(lvl, 1.0);
     let (gx, gy) = gradients(&s);
-    let xx = gaussian_box(&gx.zip_map(&gx, |a, b| a * b), 1.5);
-    let yy = gaussian_box(&gy.zip_map(&gy, |a, b| a * b), 1.5);
-    let xy = gaussian_box(&gx.zip_map(&gy, |a, b| a * b), 1.5);
+    let xx = gaussian(&gx.zip_map(&gx, |a, b| a * b), 1.5);
+    let yy = gaussian(&gy.zip_map(&gy, |a, b| a * b), 1.5);
+    let xy = gaussian(&gx.zip_map(&gy, |a, b| a * b), 1.5);
     let mut r = Plane::new(w, h);
     for i in 0..r.data.len() {
         let (a, b, c) = (xx.data[i], yy.data[i], xy.data[i]);

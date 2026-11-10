@@ -106,9 +106,8 @@ fn a_failed_write_is_held_reported_and_retried() {
     let fail = Arc::new(AtomicBool::new(true));
     let f = fail.clone();
     fault::install(&dir, Arc::new(move |_| if f.load(Ordering::SeqCst) { Err(std::io::Error::other("disk full (test)")) } else { Ok(()) }));
-    store.append(LOG, b"1\n").unwrap();
-    // The writer may publish the failure between appends; a refused append stays with the caller.
-    let second_refused = store.append(LOG, b"2\n").is_err();
+    // (one append: the log thread can fail the first before a second arrives, and then refuses it)
+    store.append(LOG, b"1\n2\n").unwrap();
     wait_until("the failure is published", || store.unwritten().is_some());
     let (held, why) = store.unwritten().unwrap();
     assert!(why.contains("disk full"), "{why}");
@@ -117,12 +116,10 @@ fn a_failed_write_is_held_reported_and_retried() {
     assert!(refused.is_err(), "refused while held");
     assert!(store.flush().is_err(), "a flush says it isn't written");
     // a read through the store still sees what was handed over
-    let visible = if second_refused { &b"0\n1\n"[..] } else { &b"0\n1\n2\n"[..] };
-    assert_eq!(store.read(LOG).unwrap().unwrap(), visible);
+    assert_eq!(store.read(LOG).unwrap().unwrap(), b"0\n1\n2\n");
     // a cut within what is held keeps it (the journal cuts back to its own length on an error)
-    let held_len = if second_refused { 4 } else { 6 };
-    store.truncate(LOG, held_len).unwrap();
-    assert_eq!(store.read(LOG).unwrap().unwrap(), visible);
+    store.truncate(LOG, 6).unwrap();
+    assert_eq!(store.read(LOG).unwrap().unwrap(), b"0\n1\n2\n");
     // a fragment of a failed write left in the file is cut before the retry
     {
         use std::io::Write;
@@ -131,9 +128,6 @@ fn a_failed_write_is_held_reported_and_retried() {
     }
     fail.store(false, Ordering::SeqCst);
     wait_until("retried on its own", || store.unwritten().is_none());
-    if second_refused {
-        store.append(LOG, b"2\n").unwrap();
-    }
     store.append(LOG, b"3\n").unwrap();
     store.flush().unwrap();
     assert_eq!(std::fs::read(dir.join(LOG)).unwrap(), b"0\n1\n2\n3\n");

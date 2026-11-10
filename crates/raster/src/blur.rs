@@ -1,6 +1,4 @@
-//! Separable Gaussian blur: variance-exact sampled windows below 2.5 px, otherwise a
-//! third-order Young–van Vliet recursive filter with Triggs–Sdika clamp boundaries.
-//! [`gaussian_box`] preserves the legacy process and the GPU's three-box approximation.
+//! Gaussian-like blur by three successive box filters (running sums, O(1) per pixel per pass).
 
 use crate::resample::Pixel;
 use crate::{Image, par_rows};
@@ -10,34 +8,6 @@ use crate::{Image, par_rows};
 /// width's square overflow (from about 23 170 px: a panic where overflow is checked, a garbage
 /// radius of billions of pixels, i.e. a hung render, where it isn't).
 pub const MAX_SIGMA: f32 = 65_536.0;
-
-/// A normalized sampled Gaussian whose discrete variance is `sigma²`.
-///
-/// Returns `None` for non-finite, non-positive or greater-than-33-pixel sigmas, bounding its cost.
-pub fn variance_exact_kernel(sigma: f32) -> Option<Vec<f32>> {
-    if !sigma.is_finite() || sigma <= 0.0 || sigma > 33.0 {
-        return None;
-    }
-    let half = (3.0 * sigma).ceil() as i32;
-    let target = f64::from(sigma).powi(2);
-    let sample = |width: f64| {
-        let mut weights: Vec<f64> = (-half..=half).map(|offset| (-f64::from(offset * offset) / (2.0 * width * width)).exp()).collect();
-        let sum: f64 = weights.iter().sum();
-        weights.iter_mut().for_each(|weight| *weight /= sum);
-        weights
-    };
-    let (mut low, mut high) = (f64::from(sigma) * 0.01, f64::from(sigma) * 2.0 + 1.0);
-    for _ in 0..48 {
-        let middle = (low + high) * 0.5;
-        let variance: f64 = sample(middle).iter().enumerate().map(|(index, weight)| weight * (index as f64 - f64::from(half)).powi(2)).sum();
-        if variance < target {
-            low = middle;
-        } else {
-            high = middle;
-        }
-    }
-    Some(sample((low + high) * 0.5).into_iter().map(|weight| weight as f32).collect())
-}
 
 /// Box radii approximating a Gaussian of `sigma` with 3 passes (Kovesi / Wells). A sigma that is
 /// not a number counts as 0 (no blur); one above [`MAX_SIGMA`] (infinity too) as `MAX_SIGMA`.
@@ -56,7 +26,7 @@ pub fn box_radii(sigma: f32) -> [usize; 3] {
     std::array::from_fn(|i| (((if (i as i32) < m { wl } else { wu }) - 1) / 2).max(0) as usize)
 }
 
-/// Standard deviation (px) of the blur [`gaussian_box`] actually makes for `sigma`: its boxes are
+/// Standard deviation (px) of the blur [`gaussian`] actually makes for `sigma`: its boxes are
 /// whole pixels wide, so small radii snap to a few steps (0 below about 0.58 px, then √(2/3) px for one
 /// 3-px box per axis, …).
 pub fn box_sigma(sigma: f32) -> f32 {
@@ -120,7 +90,7 @@ fn box_v<T: Pixel>(src: &Image<T>, dst: &mut Image<T>, r: usize) {
     });
 }
 
-/// The box radii of [`gaussian_box`] on a `w × h` image (the GPU renderer's twin uses them too), or
+/// The box radii of [`gaussian`] on a `w × h` image (the GPU renderer's twin uses them too), or
 /// `None` when the blur leaves the image as it is: `sigma` at most 0.3 or not a number, or an
 /// empty image. A sigma wider than twice the image's long side counts as that: a crop a hair
 /// wide shown to fit asked the tone and dehaze stages for sigmas of millions of pixels (infinite
@@ -134,7 +104,7 @@ pub fn radii_for(sigma: f32, w: usize, h: usize) -> Option<[usize; 3]> {
 }
 
 /// Blur with Gaussian `sigma` (pixels). `sigma <= 0.3` returns a copy.
-pub fn gaussian_box<T: Pixel>(img: &Image<T>, sigma: f32) -> Image<T> {
+pub fn gaussian<T: Pixel>(img: &Image<T>, sigma: f32) -> Image<T> {
     let Some(radii) = radii_for(sigma, img.width, img.height) else {
         return img.clone();
     };
@@ -154,42 +124,6 @@ pub fn gaussian_box<T: Pixel>(img: &Image<T>, sigma: f32) -> Image<T> {
         std::mem::swap(&mut a, &mut b);
     }
     a
-}
-
-/// Apply the shared Young–van Vliet kernel to built-in floating pixel formats. `None` means an
-/// unsupported layout/input and lets the caller retain the legacy custom-pixel path.
-pub(crate) fn shared_image<const N: usize, T: Pixel>(
-    image: &Image<T>,
-    sigma: f32,
-    widen: impl Fn(T) -> [f64; N],
-    narrow: impl Fn([f64; N]) -> T,
-) -> Option<Image<T>> {
-    use craft_blur::{Cancel, Edge, Gaussian, Quality, Scratch, Shape};
-    if image.width == 0 || image.height == 0 {
-        return Some(image.clone());
-    }
-    let shape = Shape::new(image.width, image.height, N).ok()?;
-    let filter = Gaussian::new(sigma, Quality::RecursiveRaw).ok()?;
-    let mut pixels = Vec::with_capacity(shape.samples());
-    for &pixel in &image.data {
-        pixels.extend(widen(pixel).map(|value| value as f32));
-    }
-    filter.apply(&mut pixels, shape, Edge::Clamp, &mut Scratch::default(), Cancel::Never).ok()?;
-    let mut out = Image::new(image.width, image.height);
-    let (pixels, remainder) = pixels.as_chunks::<N>();
-    debug_assert!(remainder.is_empty());
-    out.data = pixels.iter().map(|values| narrow(std::array::from_fn(|i| f64::from(values[i])))).collect();
-    Some(out)
-}
-
-/// Blur with the variance-calibrated sampled kernel at small sigma and the shared recursive
-/// Gaussian otherwise. Legacy saved renders stay on [`gaussian_box`] through their process version.
-pub fn gaussian<T: Pixel>(image: &Image<T>, sigma: f32) -> Image<T> {
-    if !sigma.is_finite() || sigma <= 0.0 || image.width == 0 || image.height == 0 {
-        return gaussian_box(image, sigma);
-    }
-    let sigma = sigma.min(MAX_SIGMA).min((image.width.max(image.height) as f32 * 2.0).max(1.0));
-    T::gaussian_shared(image, sigma).unwrap_or_else(|| gaussian_box(image, sigma))
 }
 
 /// Largest sigma [`gauss_taps`] makes taps for (larger ones are clamped to it). The GPU blur reads
@@ -250,21 +184,6 @@ mod tests {
             assert!(taps.len() <= 385 && taps.len() % 2 == 1);
             assert!(taps.iter().all(|v| v.is_finite() && *v >= 0.0));
             assert!((taps.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn exact_kernel_has_requested_variance() {
-        for sigma in [0.3f32, 0.5, 0.7, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0, 33.0] {
-            let kernel = super::variance_exact_kernel(sigma).expect("valid sigma");
-            let half = kernel.len() / 2;
-            let sum: f32 = kernel.iter().sum();
-            let variance: f32 = kernel.iter().enumerate().map(|(index, weight)| weight * (index as f32 - half as f32).powi(2)).sum();
-            assert!((sum - 1.0).abs() < 1e-5, "sigma {sigma}: sum {sum}");
-            assert!((variance / sigma.powi(2) - 1.0).abs() < 0.01, "sigma {sigma}: variance {variance}");
-        }
-        for sigma in [0.0, -1.0, f32::NAN, f32::INFINITY, 33.01] {
-            assert!(super::variance_exact_kernel(sigma).is_none());
         }
     }
 
@@ -343,7 +262,7 @@ mod tests {
         for sigma in [1.0f32, 2.5, 8.0] {
             let mut imp = Image::<f32>::new(201, 1);
             imp.set(100, 0, 1.0);
-            let b = gaussian_box(&imp, sigma);
+            let b = gaussian(&imp, sigma);
             let var: f32 = b.data.iter().enumerate().map(|(i, v)| v * ((i as f32 - 100.0).powi(2))).sum();
             assert!((var.sqrt() - box_sigma(sigma)).abs() < 1e-3, "{sigma}: {} vs {}", var.sqrt(), box_sigma(sigma));
         }
