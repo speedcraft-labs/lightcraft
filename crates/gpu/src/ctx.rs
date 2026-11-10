@@ -1525,6 +1525,8 @@ mod tests {
             return;
         };
         let optional = || gpu.kernels.read().unwrap().keys().filter(|name| name.starts_with("median_h_") || name.starts_with("median_v_")).count();
+        let joint = gpu.kernels.read().unwrap().keys().filter(|name| name.starts_with("nrcj_")).count();
+        assert_eq!(joint, 0, "startup must not compile joint colour NR for a photo that does not use it");
         assert_eq!(optional(), 0, "startup must not compile radius-specific sorting networks");
         let (h, v) = super::MEDIAN_NETWORKS[0];
         assert!(gpu.ensure_median_kernels(1));
