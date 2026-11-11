@@ -176,10 +176,14 @@ impl LightcraftApp {
             && !self.renderer.is_pending(Slot::Main)
             && !self.renderer.is_pending(Slot::Region);
         let (first, complete) = match a.map(|a| (a.kind.as_str(), a.initial_key)) {
-            Some(("startup", _)) => (
-                main_ready || self.renderer.thumb_textures() > 0 || (self.session.active().is_none() && self.fonts_ready),
-                main_ready || self.renderer.thumb_textures() > 0 || (self.session.active().is_none() && self.fonts_ready),
-            ),
+            Some(("startup", _)) => {
+                if self.ui.view == crate::state::ViewMode::Detail && self.session.active().is_some() {
+                    (self.loupe_shown.is_some_and(|(photo, src)| src != "none" && self.session.active() == Some(photo)), main_ready)
+                } else {
+                    let empty = self.session.active().is_none() && self.fonts_ready;
+                    (empty || self.renderer.thumb_textures() > 0, empty || self.renderer.thumb_textures() > 0)
+                }
+            }
             Some(("import", _)) => {
                 // The grid is virtualized: only on-screen cells can be presented in a frame.
                 // The driver verifies every catalog filename and every page outside this clock.
@@ -230,6 +234,33 @@ mod tests {
         assert_eq!(value["result"]["control_wait_ns"], 0);
         assert_eq!(value["result"]["completion_frames"], 2);
         assert!(r.begin(&json!({"id":"1","action":"switch"}), None).is_err());
+    }
+    #[test]
+    fn detail_startup_does_not_complete_from_a_filmstrip_thumbnail() {
+        let mut app = crate::LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services::default());
+        let photo = app.session.active().unwrap();
+        app.ui.view = crate::state::ViewMode::Detail;
+        let ctx = egui::Context::default();
+        app.renderer.textures.insert(
+            Slot::Thumb(photo),
+            crate::render::Tex {
+                look: None,
+                key: 0,
+                photo,
+                tex: ctx.load_texture("test-thumb", egui::ColorImage::filled([1, 1], egui::Color32::WHITE), Default::default()),
+                size: [1, 1],
+                histogram: None,
+                ms: 0.0,
+                quick: None,
+                pixels: None,
+                native: None,
+            },
+        );
+        assert_eq!(app.renderer.thumb_textures(), 1);
+        app.latency = Some(Recorder::new());
+        app.latency.as_mut().unwrap().startup(Instant::now());
+        app.loupe_shown = None;
+        assert!(app.latency_frame().is_none());
     }
     #[test]
     fn disabled_recorder_adds_no_frame_work() {
