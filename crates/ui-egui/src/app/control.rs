@@ -35,11 +35,12 @@ impl LightcraftApp {
                 }
             }
             let outcome = control::handle(self, ctx, &req);
-            if req.params.get("_latency").is_some_and(|m| m["action"] == "preview") && req.params["command"] == "view.detail" {
-                if let Err(e) = self.run("view.zoom100", serde_json::json!({})) {
-                    let _ = reply.send(control::failure(e));
-                    continue;
-                }
+            if req.params.get("_latency").is_some_and(|m| m["action"] == "preview")
+                && req.params["command"] == "view.detail"
+                && let Err(e) = self.run("view.zoom100", serde_json::json!({}))
+            {
+                let _ = reply.send(control::failure(e));
+                continue;
             }
             match outcome {
                 control::Outcome::Done(v) => {

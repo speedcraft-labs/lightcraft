@@ -68,6 +68,18 @@ impl Recorder {
         state.records.push(json!({"id":id,"action":kind,"accepted_ns":accepted,"first_reflecting_frame_presented_ns":null,"completed_ns":null,
             "endpoint":"reflecting-frame-gpu-work-confirmed-complete","control_wait_ns":0}));
         self.active = Some(Action { id: id.into(), kind: kind.into(), accepted, frame: self.frame, initial_key });
+        // Explicit harness-only physical slowdown, inside the acceptance clock. Both compared
+        // binaries contain this code; ordinary requests and disabled frames do not sleep.
+        if kind == "switch"
+            && let Some(delay) = meta["test_delay_ns"].as_u64().filter(|n| *n > 0 && *n <= 1_000_000_000)
+        {
+            let before = ns(self.epoch);
+            std::thread::sleep(std::time::Duration::from_nanos(delay));
+            if let Some(r) = state.records.last_mut() {
+                r["test_delay_requested_ns"] = json!(delay);
+                r["test_delay_actual_ns"] = json!(ns(self.epoch).saturating_sub(before));
+            }
+        }
         Ok(())
     }
     pub(crate) fn wait(&mut self, params: &Value, reply: Sender<Value>) -> Result<(), &'static str> {
