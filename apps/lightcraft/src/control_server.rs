@@ -88,11 +88,12 @@ fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, id
         return;
     }
     serve_stream(stream, |method, params| {
+        let timeout = if method == "ui.latency.wait" { Duration::from_secs(600) } else { REPLY_TIMEOUT };
         let (req, rrx) = ControlRequest::new(method, params);
         let state = Arc::clone(&req.state);
         tx.send(req).ok()?;
         ctx.request_repaint();
-        Some(await_reply(&rrx, &state, || ctx.cumulative_pass_nr(), || ctx.request_repaint(), NO_FRAMES_AFTER, REPLY_TIMEOUT))
+        Some(await_reply(&rrx, &state, || ctx.cumulative_pass_nr(), || ctx.request_repaint(), NO_FRAMES_AFTER, timeout))
     });
 }
 
