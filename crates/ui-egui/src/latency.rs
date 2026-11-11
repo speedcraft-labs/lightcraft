@@ -13,6 +13,25 @@ struct State {
     waiters: Vec<(String, Sender<Value>)>,
 }
 
+/// Socket-thread access to records; no UI dispatch, input injection or repaint hook.
+#[derive(Clone)]
+pub struct Reader(Arc<Mutex<State>>);
+impl Reader {
+    pub fn wait(&self, params: &Value, reply: Sender<Value>) -> Result<(), &'static str> {
+        let id = params["id"].as_str().ok_or("missing latency id")?;
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = state.records.iter().find(|r| r["id"] == id).ok_or("unknown latency id")?;
+        if !record["completed_ns"].is_null() {
+            let _ = reply.send(control::success(record.clone()));
+        } else if state.waiters.len() < 16 {
+            state.waiters.push((id.into(), reply));
+        } else {
+            return Err("too many latency waiters");
+        }
+        Ok(())
+    }
+}
+
 /// A bounded, session-local recorder. Constructed only when explicitly enabled.
 pub struct Recorder {
     epoch: Instant,
@@ -30,7 +49,7 @@ struct Action {
 
 impl Recorder {
     pub fn from_env() -> Option<Self> {
-        (std::env::var("LIGHTCRAFT_LATENCY").as_deref() == Ok("1")).then(Self::new)
+        (std::env::var("LIGHTCRAFT_LATENCY").as_deref() == Ok("1")).then(Self::enabled)
     }
     /// Desktop entry-point clock, before settings, engine and window creation.
     pub fn startup(&mut self, entry: Instant) {
@@ -45,7 +64,7 @@ impl Recorder {
             }
         }
     }
-    fn new() -> Self {
+    pub fn enabled() -> Self {
         Self { epoch: Instant::now(), state: Arc::new(Mutex::new(State::default())), active: None, frame: 0 }
     }
     pub(crate) fn begin(&mut self, meta: &Value, initial_key: Option<u64>) -> Result<(), &'static str> {
@@ -82,18 +101,12 @@ impl Recorder {
         }
         Ok(())
     }
+    /// A thread-safe read endpoint. It cannot change app state or request frames.
+    pub fn reader(&self) -> Reader {
+        Reader(self.state.clone())
+    }
     pub(crate) fn wait(&mut self, params: &Value, reply: Sender<Value>) -> Result<(), &'static str> {
-        let id = params["id"].as_str().ok_or("missing latency id")?;
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let record = state.records.iter().find(|r| r["id"] == id).ok_or("unknown latency id")?;
-        if !record["completed_ns"].is_null() {
-            let _ = reply.send(control::success(record.clone()));
-        } else if state.waiters.len() < 16 {
-            state.waiters.push((id.into(), reply));
-        } else {
-            return Err("too many latency waiters");
-        }
-        Ok(())
+        self.reader().wait(params, reply)
     }
     /// Called only by an enabled host after layout. The closure must be attached to THIS
     /// frame's submission, never a prior queue fence or the next event-loop callback.
@@ -221,10 +234,11 @@ mod tests {
     use super::*;
     #[test]
     fn records_only_complete_on_the_hosts_frame_fence() {
-        let mut r = Recorder::new();
+        let mut r = Recorder::enabled();
         r.begin(&json!({"id":"1","action":"switch"}), None).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        r.wait(&json!({"id":"1"}), tx).unwrap();
+        let reader = r.reader();
+        std::thread::spawn(move || reader.wait(&json!({"id":"1"}), tx).unwrap()).join().unwrap();
         assert!(r.observe(false, false, vec![]).is_none());
         let done = r.observe(true, true, vec!["prefetch".into()]).unwrap();
         assert!(rx.try_recv().is_err());
@@ -257,7 +271,7 @@ mod tests {
             },
         );
         assert_eq!(app.renderer.thumb_textures(), 1);
-        app.latency = Some(Recorder::new());
+        app.latency = Some(Recorder::enabled());
         app.latency.as_mut().unwrap().startup(Instant::now());
         app.loupe_shown = None;
         assert!(app.latency_frame().is_none());

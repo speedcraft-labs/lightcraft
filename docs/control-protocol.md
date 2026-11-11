@@ -431,8 +431,9 @@ A recorded request has an extra top-level params member, for example:
 {"id":2,"method":"ui.latency.wait","params":{"id":"switch-1"}}
 ```
 
-The second request receives one deferred response after completion. It does not
-block the UI thread. Records contain UI-thread acceptance, first reflecting frame
+The second request receives one deferred response after completion. A shared
+recorder reader serves it on the socket thread, without UI dispatch or any
+repaint request. It does not block the UI thread. Records contain UI-thread acceptance, first reflecting frame
 and completion timestamps in monotonic nanoseconds relative to this process's
 recorder epoch, UI frame counts, and pending-work snapshots from those frames.
 The endpoint explicitly means **GPU work for that frame confirmed complete**,

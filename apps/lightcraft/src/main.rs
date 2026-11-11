@@ -422,7 +422,7 @@ fn main() -> eframe::Result {
                     app.notices.push(notice);
                 }
                 if let Some(port) = control_port {
-                    let rx = control_server::start(port, cc.egui_ctx.clone());
+                    let rx = control_server::start(port, cc.egui_ctx.clone(), app.latency.as_ref().map(|r| r.reader()));
                     app = app.with_control(rx);
                 }
                 if let Some(mut p) = problem {

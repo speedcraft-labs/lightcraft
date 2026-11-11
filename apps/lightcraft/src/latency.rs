@@ -12,6 +12,9 @@ type Work = Arc<AtomicBool>;
 static POLLER: OnceLock<mpsc::Sender<Work>> = OnceLock::new();
 
 pub fn frame(app: &mut LightcraftApp, ui: &egui::Ui, frame: &eframe::Frame) {
+    if ui.ctx().will_discard() {
+        return;
+    }
     let Some(done) = app.latency_frame() else { return };
     let Some(rs) = frame.wgpu_render_state() else { return };
     let device = rs.device.clone();
