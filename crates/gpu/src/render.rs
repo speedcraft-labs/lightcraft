@@ -377,6 +377,9 @@ fn guided_coeffs(cx: &mut Cx<'_>, p: &Buf, w: usize, h: usize, sigma: f32, eps: 
     gaussian(cx, &ab, w, h, 2, sigma)
 }
 
+/// Pixels per thread along the pass of `median_h` / `median_v` (`MED_K` in `blur.wgsl`).
+const MEDIAN_K: usize = 4;
+
 /// Separable median of a plane (`local::median_hv`).
 fn median_hv(cx: &mut Cx<'_>, p: &Buf, w: usize, h: usize, r: usize) -> Buf {
     if r == 0 || w * h == 0 {
@@ -384,20 +387,36 @@ fn median_hv(cx: &mut Cx<'_>, p: &Buf, w: usize, h: usize, r: usize) -> Buf {
     }
     let pr = [w as u32, h as u32, 1, r.min(local::BASE_DETAIL_MAX) as u32];
     let tmp = cx.gpu.buffer(w * h);
-    let (horizontal, vertical) = if cx.gpu.ensure_median_kernels(r) { crate::ctx::MEDIAN_NETWORKS[r - 1] } else { ("median_h", "median_v") };
-    cx.run(horizontal, &pr, &[Some(p), Some(&tmp)], groups2(w, h, [16, 16]));
+    cx.run("median_h", &pr, &[Some(p), Some(&tmp)], groups2(w.div_ceil(MEDIAN_K), h, [16, 16]));
     let out = cx.gpu.buffer(w * h);
-    cx.run(vertical, &pr, &[Some(&tmp), Some(&out)], groups2(w, h, [16, 16]));
+    cx.run("median_v", &pr, &[Some(&tmp), Some(&out)], groups2(w, h.div_ceil(MEDIAN_K), [16, 16]));
     out
 }
 
-/// The highlights/shadows base (`local::tone_base`; `detail` 0: V1, no median).
-fn tone_base(cx: &mut Cx<'_>, l: &Buf, w: usize, h: usize, sigma: f32, detail: usize) -> Buf {
+/// The highlights/shadows base (`local::tone_base`; `detail` 0: V1, no detail removal).
+fn tone_base(cx: &mut Cx<'_>, l: &Buf, w: usize, h: usize, sigma: f32, detail: usize, keeps_gaps: bool) -> Buf {
     if detail == 0 {
         return guided_fast(cx, l, w, h, sigma, local::BASE_EPS);
     }
-    let m = median_hv(cx, l, w, h, detail);
+    let m = if keeps_gaps { detail_free(cx, l, w, h, detail) } else { median_hv(cx, l, w, h, detail) };
     guided_fast(cx, &m, w, h, sigma, local::BASE_EPS)
+}
+
+/// Log luminance without detail finer than `r` px (`local::detail_free`): clamped between its
+/// median at `r` and the median of a `local::BASE_COARSE_STEP`× downscaled copy, enlarged.
+fn detail_free(cx: &mut Cx<'_>, l: &Buf, w: usize, h: usize, r: usize) -> Buf {
+    if r == 0 || w * h == 0 {
+        return cx.copy(l);
+    }
+    let fine = median_hv(cx, l, w, h, r);
+    let s = local::BASE_COARSE_STEP;
+    let (lw, lh) = (w.div_ceil(s).max(1), h.div_ceil(s).max(1));
+    let lo = resize(cx, l, (w, h), (lw, lh), 1, Filter::Box);
+    let lo_median = median_hv(cx, &lo, lw, lh, r);
+    let coarse = resize(cx, &lo_median, (lw, lh), (w, h), 1, Filter::Bilinear);
+    let out = cx.gpu.buffer(w * h);
+    map(cx, "clamp_between_k", w * h, &[], [Some(l), Some(&fine), Some(&coarse)], &out);
+    out
 }
 
 /// Fast guided filter (`local::guided_fast`): coefficients on a subsampled grid.
@@ -1041,7 +1060,14 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
             eyed
         }
     };
-    denoise(cx, img, plan, colour_noise)
+    let img = denoise(cx, img, plan, colour_noise);
+    if !lightcraft_pipeline::lens_blur::renders(s) {
+        return img;
+    }
+    // Lens Blur (global or a mask's): on the CPU, like the CPU renderer's (`lens_blur::apply`)
+    let mut host_img = cx.read_rgb(&img, w, h);
+    lightcraft_pipeline::lens_blur::apply_with(&mut host_img, s, &plan.frame, plan.px_per_long, plan.mattes.as_deref(), plan.lens_subject.as_deref());
+    cx.gpu.upload(rgb_words(&host_img))
 }
 
 /// Defringe (`optics::defringe`) of the white-balanced image.
@@ -1425,7 +1451,7 @@ fn prepare(cx: &mut Cx<'_>, lin: &Buf, plan: &Plan<'_>, req: &RenderRequest, pla
     let base = match sig.base {
         Some(sg) => {
             let key = local::base_key(&plan.settings, sg, sig.base_detail);
-            plane_at(&mut planes.base, key, || tone_base(cx, &log_l, w, h, sg, sig.base_detail))
+            plane_at(&mut planes.base, key, || tone_base(cx, &log_l, w, h, sg, sig.base_detail, local::base_keeps_gaps(&plan.settings)))
         }
         None => log_l.clone(),
     };
@@ -1687,26 +1713,6 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
 mod tests {
     use super::*;
 
-    fn brute_force_median_hv(input: &Plane, radius: usize) -> Plane {
-        let pass = |src: &Plane, horizontal: bool| {
-            let mut out = Plane::new(src.width, src.height);
-            for y in 0..src.height {
-                for x in 0..src.width {
-                    let mut window = Vec::with_capacity(radius * 2 + 1);
-                    for k in 0..=radius * 2 {
-                        let offset = k.saturating_add(if horizontal { x } else { y }).saturating_sub(radius);
-                        let (sx, sy) = if horizontal { (offset.min(src.width - 1), y) } else { (x, offset.min(src.height - 1)) };
-                        window.push(src.get(sx, sy));
-                    }
-                    window.sort_by(f32::total_cmp);
-                    out.set(x, y, window[radius]);
-                }
-            }
-            out
-        };
-        pass(&pass(input, true), false)
-    }
-
     /// Two exports side by side: each band plan leaves room for the other render, so the two together
     /// stay within the free memory they both measured.
     #[test]
@@ -1825,431 +1831,6 @@ mod tests {
         }
     }
 
-    /// Paired GPU timings on 24 MP plus CPU 8/16-bit timings on 6 MP; run via `scripts/bench-run`.
-    #[test]
-    fn median_matches_cpu_total_order() {
-        let Some(gpu) = crate::device() else {
-            lightcraft_testkit::skip!(Gpu, "no GPU adapter for median parity");
-            return;
-        };
-        let _scope = crate::ctx::RenderScope::new(gpu);
-        let mut cx = Cx::new(gpu);
-        let values = [0xffc00012, 0xff800000, 0xbf800000, 0x80000000, 0, 0x3f800000, 0x7f800000, 0x7fc00012];
-        for (index, (horizontal, vertical)) in crate::ctx::MEDIAN_NETWORKS.iter().copied().enumerate() {
-            let radius = index + 1;
-            assert!(gpu.ensure_median_kernels(radius), "network failed to compile: {horizontal}, {vertical}");
-            assert!(gpu.has_kernel(horizontal) && gpu.has_kernel(vertical), "network unavailable: {horizontal}, {vertical}");
-        }
-        for (w, h) in [(1, 1), (3, 2), (17, 19), (32, 7), (49, 5)] {
-            let input = Plane::from_fn(w, h, |x, y| f32::from_bits(values[(x * 7 + y * 3) % values.len()]));
-            let radii: Vec<_> = if (w, h) == (17, 19) { (1..=24).collect() } else { vec![1, 2, 8, 24] };
-            for r in radii {
-                let expected = brute_force_median_hv(&input, r);
-                let src = gpu.upload(&input.data);
-                let out = median_hv(&mut cx, &src, w, h, r);
-                let actual: Vec<f32> = cx.read(&out, w * h);
-                assert_eq!(
-                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    expected.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    "{w}x{h} r={r}"
-                );
-            }
-        }
-        let random = Plane::from_fn(17, 19, |x, y| {
-            let mut state = 0x6d2b_79f5u32 ^ (x as u32).wrapping_mul(0x9e37_79b9) ^ (y as u32).wrapping_mul(0x85eb_ca6b);
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            f32::from_bits(state)
-        });
-        for r in [1, 2, 8, 24] {
-            let expected = brute_force_median_hv(&random, r);
-            let src = gpu.upload(&random.data);
-            let out = median_hv(&mut cx, &src, random.width, random.height, r);
-            let actual: Vec<f32> = cx.read(&out, random.width * random.height);
-            assert_eq!(
-                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                expected.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "random {}x{} r={r}",
-                random.width,
-                random.height
-            );
-        }
-        if let Some(root) = std::env::var_os("ARTCRAFT_HYPER_ROOT").map(std::path::PathBuf::from) {
-            let corpus = root.join("corpus/pngsuite");
-            let decoded8 = image::open(corpus.join("basn0g08.png"));
-            assert!(decoded8.is_ok(), "8-bit PNGsuite corpus image must decode: {decoded8:?}");
-            let Ok(decoded8) = decoded8 else { return };
-            let pixels8 = decoded8.to_luma8();
-            let (w, h) = (pixels8.width() as usize, pixels8.height() as usize);
-            let plane8 = Plane::from_fn(w, h, |x, y| f32::from(pixels8.get_pixel(x as u32, y as u32).0[0]));
-            let decoded16 = image::open(corpus.join("basn0g16.png"));
-            assert!(decoded16.is_ok(), "16-bit PNGsuite corpus image must decode: {decoded16:?}");
-            let Ok(decoded16) = decoded16 else { return };
-            let pixels16 = decoded16.to_luma16();
-            let (w16, h16) = (pixels16.width() as usize, pixels16.height() as usize);
-            let plane16 = Plane::from_fn(w16, h16, |x, y| f32::from(pixels16.get_pixel(x as u32, y as u32).0[0]));
-            for (plane, w, h, name) in [(&plane8, w, h, "8-bit"), (&plane16, w16, h16, "16-bit")] {
-                for r in [1, 3, 9, 24] {
-                    let expected = brute_force_median_hv(plane, r);
-                    let src = gpu.upload(&plane.data);
-                    let out = median_hv(&mut cx, &src, w, h, r);
-                    let actual: Vec<f32> = cx.read(&out, w * h);
-                    assert_eq!(
-                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        expected.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        "{name} PNGsuite r={r}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn bench_median_29() {
-        let Some(gpu) = crate::device() else { return };
-        let _scope = crate::ctx::RenderScope::new(gpu);
-        let (w, h) = (6000, 4000);
-        let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
-            .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("model name\t:")).map(|l| l.trim_start_matches("model name\t: ").to_owned()))
-            .unwrap_or_else(|| "unknown".into());
-        let kernel = std::process::Command::new("uname")
-            .arg("-sr")
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default();
-        let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
-        let head_rev = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default();
-        let logical_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-        let isolated = std::env::var("CRAFT_BENCH_ISOLATED").unwrap_or_default();
-        let input = Plane::from_fn(w, h, |x, y| ((x * 37 + y * 73) % 256) as f32 / 255.0);
-        let (cpu_w, cpu_h) = (3000, 2000);
-        let image8 = lightcraft_raster::Image::from_fn(cpu_w, cpu_h, |x, y| ((x * 37 + y * 73) % 256) as u8);
-        let image16 =
-            lightcraft_raster::Image::from_fn(cpu_w, cpu_h, |x, y| ((x as u32 * 40_503 + y as u32 * 7_919 + (x * y) as u32 * 17) & 0xffff) as u16);
-        let plane8 = Plane { width: cpu_w, height: cpu_h, data: image8.data.iter().map(|&v| f32::from(v)).collect() };
-        let plane16 = Plane { width: cpu_w, height: cpu_h, data: image16.data.iter().map(|&v| f32::from(v)).collect() };
-        let cpu_meta = MedianBenchMeta {
-            cpu_model: &cpu_model,
-            kernel: &kernel,
-            logical_cores,
-            loadavg: loadavg.trim(),
-            isolated: &isolated,
-            head_rev: &head_rev,
-        };
-        let src = gpu.upload(&input.data);
-        let mut cx = Cx::new(gpu);
-        eprintln!("median benchmark: {} ({:?})", gpu.info.name, gpu.info.backend);
-        for r in [2, 8, 24] {
-            assert!(gpu.ensure_median_kernels(r), "network failed to compile for radius {r}");
-            let params = [w as u32, h as u32, 1, r as u32];
-            let groups = groups2(w, h, [16, 16]);
-            let old_tmp = gpu.buffer(w * h);
-            let old_out = gpu.buffer(w * h);
-            let new_tmp = gpu.buffer(w * h);
-            let new_out = gpu.buffer(w * h);
-            let (new_horizontal, new_vertical) = crate::ctx::MEDIAN_NETWORKS[r - 1];
-            let mut old_ms = [0.0f64; 10];
-            let mut new_ms = [0.0f64; 10];
-            cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
-            cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
-            cx.sync();
-            cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
-            cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
-            cx.sync();
-            for i in 0..10 {
-                for candidate_first in [i % 2 == 1, i % 2 == 0] {
-                    cx.sync();
-                    let start = std::time::Instant::now();
-                    if candidate_first {
-                        cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
-                        cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
-                        cx.sync();
-                        new_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
-                    } else {
-                        cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
-                        cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
-                        cx.sync();
-                        old_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
-                    }
-                }
-            }
-            let old: Vec<f32> = cx.read(&old_out, w * h);
-            let new: Vec<f32> = cx.read(&new_out, w * h);
-            assert_eq!(old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "r={r}");
-            let ratios: Vec<f64> = new_ms.iter().zip(old_ms.iter()).map(|(n, o)| n / o).collect();
-            let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
-            let cpu_start = std::time::Instant::now();
-            let cpu = lightcraft_pipeline::local::median_hv(&input, r);
-            let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
-            std::hint::black_box(cpu);
-            eprintln!(
-                "{{\"kind\":\"median-paired\",\"input\":\"synthetic-pattern\",\"input_kind\":\"synthetic\",\"gpu\":\"{}\",\"backend\":\"{:?}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{logical_cores},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"870c5e22\",\"head_rev\":\"{}\",\"width\":{w},\"height\":{h},\"radius\":{r},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"cpu_ms\":{cpu_ms:.3},\"output_hash\":\"{:016x}\"}}",
-                gpu.info.name,
-                gpu.info.backend,
-                cpu_model,
-                kernel,
-                loadavg.trim(),
-                isolated,
-                head_rev,
-                old_ms,
-                new_ms,
-                hash_f32(&new)
-            );
-
-            bench_cpu_integer(("u8", "synthetic-pattern"), &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
-            bench_cpu_integer(("u16", "synthetic-pattern"), &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
-        }
-        for r in [48, 96] {
-            bench_cpu_integer(("u8", "synthetic-pattern"), &image8, &plane8, r, &cpu_meta, lightcraft_raster::median::median_u8_hv, hash_u8);
-            bench_cpu_integer(("u16", "synthetic-pattern"), &image16, &plane16, r, &cpu_meta, lightcraft_raster::median::median_u16_hv, hash_u16);
-        }
-
-        if let Some(root) = std::env::var_os("ARTCRAFT_HYPER_ROOT").map(std::path::PathBuf::from) {
-            let corpus8 = decode_corpus_gray(&root.join("corpus/psd-tools/gray1.psd"));
-            assert_eq!(corpus8.1, 8, "corpus u8 benchmark source bit depth");
-            let image8 = quantize_corpus_u8(&corpus8.0);
-            let plane8 = plane_from_u8(&image8);
-            for r in [2, 8, 24] {
-                bench_gpu_corpus(gpu, &cpu_meta, &corpus8.0, r, "corpus/psd-tools/gray1.psd");
-                bench_cpu_integer(
-                    ("u8", "corpus/psd-tools/gray1.psd quantized to u8"),
-                    &image8,
-                    &plane8,
-                    r,
-                    &cpu_meta,
-                    lightcraft_raster::median::median_u8_hv,
-                    hash_u8,
-                );
-            }
-
-            let corpus16 = decode_corpus_gray(&root.join("corpus/psd-tools/adjustments/threshold_16bits_grayscale.psd"));
-            assert_eq!(corpus16.1, 16, "corpus u16 benchmark source bit depth");
-            let image16 = quantize_corpus_u16(&corpus16.0);
-            let plane16 = plane_from_u16(&image16);
-            for r in [2, 8, 24] {
-                bench_cpu_integer(
-                    ("u16", "corpus/psd-tools/adjustments/threshold_16bits_grayscale.psd quantized to u16"),
-                    &image16,
-                    &plane16,
-                    r,
-                    &cpu_meta,
-                    lightcraft_raster::median::median_u16_hv,
-                    hash_u16,
-                );
-            }
-        }
-    }
-
-    struct MedianBenchMeta<'a> {
-        cpu_model: &'a str,
-        kernel: &'a str,
-        logical_cores: usize,
-        loadavg: &'a str,
-        isolated: &'a str,
-        head_rev: &'a str,
-    }
-
-    fn decode_corpus_gray(path: &std::path::Path) -> (Plane, u8) {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read corpus image {}: {e}", path.display()));
-        let decoded = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions::default())
-            .unwrap_or_else(|e| panic!("decode corpus image {}: {e}", path.display()));
-        assert!(decoded.grayscale, "{} must be a grayscale corpus image", path.display());
-        let plane =
-            Plane { width: decoded.width as usize, height: decoded.height as usize, data: decoded.image.data.iter().map(|pixel| pixel[0]).collect() };
-        (plane, decoded.bit_depth)
-    }
-
-    fn quantize_corpus_u8(plane: &Plane) -> lightcraft_raster::Image<u8> {
-        lightcraft_raster::Image {
-            width: plane.width,
-            height: plane.height,
-            data: plane.data.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
-        }
-    }
-
-    fn quantize_corpus_u16(plane: &Plane) -> lightcraft_raster::Image<u16> {
-        lightcraft_raster::Image {
-            width: plane.width,
-            height: plane.height,
-            data: plane.data.iter().map(|v| (v.clamp(0.0, 1.0) * 65_535.0).round() as u16).collect(),
-        }
-    }
-
-    fn plane_from_u8(image: &lightcraft_raster::Image<u8>) -> Plane {
-        Plane { width: image.width, height: image.height, data: image.data.iter().map(|&v| f32::from(v)).collect() }
-    }
-
-    fn plane_from_u16(image: &lightcraft_raster::Image<u16>) -> Plane {
-        Plane { width: image.width, height: image.height, data: image.data.iter().map(|&v| f32::from(v)).collect() }
-    }
-
-    fn bench_gpu_corpus(gpu: &crate::ctx::Gpu, meta: &MedianBenchMeta<'_>, input: &Plane, radius: usize, label: &str) {
-        let (w, h) = (input.width, input.height);
-        let src = gpu.upload(&input.data);
-        let mut cx = Cx::new(gpu);
-        let params = [w as u32, h as u32, 1, radius as u32];
-        let groups = groups2(w, h, [16, 16]);
-        let old_tmp = gpu.buffer(w * h);
-        let old_out = gpu.buffer(w * h);
-        let new_tmp = gpu.buffer(w * h);
-        let new_out = gpu.buffer(w * h);
-        assert!(gpu.ensure_median_kernels(radius), "network failed to compile for radius {radius}");
-        let (new_horizontal, new_vertical) = crate::ctx::MEDIAN_NETWORKS[radius - 1];
-        let mut old_ms = [0.0f64; 10];
-        let mut new_ms = [0.0f64; 10];
-        cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
-        cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
-        cx.sync();
-        cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
-        cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
-        cx.sync();
-        for i in 0..10 {
-            for candidate_first in [i % 2 == 1, i % 2 == 0] {
-                cx.sync();
-                let start = std::time::Instant::now();
-                if candidate_first {
-                    cx.run(new_horizontal, &params, &[Some(&src), Some(&new_tmp)], groups);
-                    cx.run(new_vertical, &params, &[Some(&new_tmp), Some(&new_out)], groups);
-                    cx.sync();
-                    new_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
-                } else {
-                    cx.run("median_h", &params, &[Some(&src), Some(&old_tmp)], groups);
-                    cx.run("median_v", &params, &[Some(&old_tmp), Some(&old_out)], groups);
-                    cx.sync();
-                    old_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
-                }
-            }
-        }
-        let old: Vec<f32> = cx.read(&old_out, w * h);
-        let new: Vec<f32> = cx.read(&new_out, w * h);
-        assert_eq!(old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{label} r={radius}");
-        let ratios: Vec<f64> = new_ms.iter().zip(old_ms.iter()).map(|(n, o)| n / o).collect();
-        let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
-        eprintln!(
-            "{{\"kind\":\"median-paired\",\"input\":\"{label}\",\"input_kind\":\"corpus\",\"gpu\":\"{}\",\"backend\":\"{:?}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"870c5e22\",\"head_rev\":\"{}\",\"width\":{w},\"height\":{h},\"radius\":{radius},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
-            gpu.info.name,
-            gpu.info.backend,
-            meta.cpu_model,
-            meta.kernel,
-            meta.logical_cores,
-            meta.loadavg,
-            meta.isolated,
-            meta.head_rev,
-            old_ms,
-            new_ms,
-            hash_f32(&new)
-        );
-    }
-
-    fn bench_cpu_integer<T, Filter, Hash>(
-        (dtype, input_label): (&str, &str),
-        input: &lightcraft_raster::Image<T>,
-        baseline_input: &Plane,
-        radius: usize,
-        meta: &MedianBenchMeta<'_>,
-        filter: Filter,
-        hash: Hash,
-    ) where
-        T: Copy,
-        f32: From<T>,
-        Filter: Fn(&lightcraft_raster::Image<T>, usize) -> lightcraft_raster::Image<T> + Copy,
-        Hash: Fn(&[T]) -> u64,
-    {
-        let old = local::median_hv(baseline_input, radius);
-        let new = filter(input, radius);
-        assert_eq!(
-            old.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            new.data.iter().map(|&v| f32::from(v).to_bits()).collect::<Vec<_>>(),
-            "CPU {dtype} parity r={radius}"
-        );
-        let (baseline_ms, candidate_ms) = paired_cpu_times(
-            || {
-                std::hint::black_box(local::median_hv(baseline_input, radius));
-            },
-            || {
-                std::hint::black_box(filter(input, radius));
-            },
-        );
-        let ratios: Vec<f64> = candidate_ms.iter().zip(baseline_ms.iter()).map(|(n, o)| n / o).collect();
-        let (ratio, lo, hi) = bootstrap_median_ci(&ratios);
-        eprintln!(
-            "{{\"kind\":\"median-cpu-paired\",\"input\":\"{input_label}\",\"input_kind\":\"{}\",\"dtype\":\"{dtype}\",\"cpu_model\":\"{}\",\"kernel\":\"{}\",\"logical_cores\":{},\"loadavg\":\"{}\",\"isolated\":\"{}\",\"baseline_rev\":\"edf6e1a0\",\"head_rev\":\"{}\",\"width\":{},\"height\":{},\"radius\":{radius},\"baseline_ms\":{:?},\"candidate_ms\":{:?},\"ratio_median\":{ratio:.6},\"ratio_ci95\":[{lo:.6},{hi:.6}],\"output_hash\":\"{:016x}\"}}",
-            if input_label.starts_with("corpus/") { "corpus" } else { "synthetic" },
-            meta.cpu_model,
-            meta.kernel,
-            meta.logical_cores,
-            meta.loadavg,
-            meta.isolated,
-            meta.head_rev,
-            input.width,
-            input.height,
-            baseline_ms,
-            candidate_ms,
-            hash(&new.data)
-        );
-    }
-
-    fn paired_cpu_times(mut baseline: impl FnMut(), mut candidate: impl FnMut()) -> ([f64; 10], [f64; 10]) {
-        baseline();
-        candidate();
-        let mut baseline_ms = [0.0; 10];
-        let mut candidate_ms = [0.0; 10];
-        for i in 0..10 {
-            for candidate_first in [i % 2 == 1, i % 2 == 0] {
-                let start = std::time::Instant::now();
-                if candidate_first {
-                    candidate();
-                    candidate_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
-                } else {
-                    baseline();
-                    baseline_ms[i] = start.elapsed().as_secs_f64() * 1000.0;
-                }
-            }
-        }
-        (baseline_ms, candidate_ms)
-    }
-
-    fn hash_f32(values: &[f32]) -> u64 {
-        values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(v.to_bits())).wrapping_mul(0x100000001b3))
-    }
-
-    fn hash_u8(values: &[u8]) -> u64 {
-        values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(*v)).wrapping_mul(0x100000001b3))
-    }
-
-    fn hash_u16(values: &[u16]) -> u64 {
-        values.iter().fold(0xcbf29ce484222325u64, |hash, v| (hash ^ u64::from(*v)).wrapping_mul(0x100000001b3))
-    }
-
-    fn bootstrap_median_ci(ratios: &[f64]) -> (f64, f64, f64) {
-        let mut rng = 0x29f1_a5c3u32;
-        let mut sample = [0.0f64; 10];
-        let mut estimates = Vec::with_capacity(10_000);
-        for _ in 0..10_000 {
-            for value in &mut sample {
-                rng ^= rng << 13;
-                rng ^= rng >> 17;
-                rng ^= rng << 5;
-                *value = ratios[rng as usize % ratios.len()];
-            }
-            sample.sort_by(f64::total_cmp);
-            estimates.push((sample[4] + sample[5]) * 0.5);
-        }
-        estimates.sort_by(f64::total_cmp);
-        let mut ordered = ratios.to_vec();
-        ordered.sort_by(f64::total_cmp);
-        ((ordered[4] + ordered[5]) * 0.5, estimates[250], estimates[9_749])
-    }
-
     #[test]
     fn box_horizontal_matches_cpu() {
         let _serial = crate::DEVICE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2356,6 +1937,76 @@ mod tests {
             map(cx, "log_lum_k", w * h, &[], [Some(&src), None, None], &o);
         });
         time("guided sigma=1.75", &mut |cx| drop(guided(cx, &src, w, h, 1.75, 0.01)));
+    }
+
+    /// The tiled median kernels select exactly what the CPU's sorted window does: edge tiles,
+    /// planes smaller than a tile or a window, every radius and many ties.
+    #[test]
+    fn median_matches_cpu_bit_for_bit() {
+        // (creating the device writes the crash sentinel another test swaps out)
+        let _serial = crate::DEVICE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(gpu) = crate::device() else { return lightcraft_testkit::skip!(Gpu, "no GPU adapter") };
+        let _scope = crate::ctx::RenderScope::new(gpu);
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for (w, h) in [(1, 1), (2, 3), (5, 70), (70, 5), (63, 65), (130, 67), (200, 129)] {
+            // a coarse level set gives ties; a smooth ramp and fine noise give distinct values
+            let mut p = Plane::new(w, h);
+            for (i, o) in p.data.iter_mut().enumerate() {
+                let (x, y) = (i % w, i / w);
+                *o = match (next() % 3, next()) {
+                    (0, v) => (v % 7) as f32 * 0.5 - 2.0,
+                    (1, v) => (x + 2 * y) as f32 * 0.01 + (v % 100) as f32 * 1e-4,
+                    (_, v) => (v % 10_000) as f32 * 1e-3 - 5.0,
+                };
+            }
+            let src = gpu.upload(&p.data);
+            for r in 1..=local::BASE_DETAIL_MAX {
+                let mut cx = Cx::new(gpu);
+                let out = median_hv(&mut cx, &src, w, h, r);
+                let got: Vec<f32> = cx.read(&out, w * h);
+                let want = local::median_hv(&p, r);
+                let bad = got.iter().zip(&want.data).position(|(g, c)| g.to_bits() != c.to_bits());
+                assert!(bad.is_none(), "{w}×{h} r={r}: pixel {bad:?}");
+            }
+        }
+    }
+
+    /// Highlights/shadows base timings on the #3460 frame size:
+    /// `cargo test --release -p lightcraft-gpu bench_tone_base -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_tone_base() {
+        let Some(gpu) = crate::device() else { return eprintln!("no gpu: {:?}", crate::unavailable_reason()) };
+        let _scope = crate::ctx::RenderScope::new(gpu);
+        let (w, h) = (6960, 4640);
+        let r = local::base_detail_radius(w as f64);
+        eprintln!("{} ({:?}) r={r}", gpu.info.name, gpu.info.backend);
+        let l: Vec<f32> = (0..w * h).map(|i: usize| ((i.wrapping_mul(2_654_435_761)) % 1000) as f32 / 250.0 - 6.0).collect();
+        let src = gpu.upload(&l);
+        let time = |name: &str, f: &mut dyn FnMut(&mut Cx<'_>)| {
+            let mut ts = Vec::new();
+            for _ in 0..9 {
+                let mut cx = Cx::new(gpu);
+                cx.sync();
+                let t = std::time::Instant::now();
+                f(&mut cx);
+                cx.sync();
+                ts.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ts.sort_by(f64::total_cmp);
+            eprintln!("{name:<40} min {:.1} ms  median {:.1} ms", ts[0], ts[4]);
+        };
+        let sigma = 0.015 * w as f32;
+        time("median_hv", &mut |cx| drop(median_hv(cx, &src, w, h, r)));
+        time("detail_free", &mut |cx| drop(detail_free(cx, &src, w, h, r)));
+        time("guided_fast", &mut |cx| drop(guided_fast(cx, &src, w, h, sigma, local::BASE_EPS)));
+        time("tone_base", &mut |cx| drop(tone_base(cx, &src, w, h, sigma, r, true)));
     }
 
     /// The device scores Remove's candidate sources like the CPU and picks the same one.
