@@ -443,9 +443,13 @@ late if that worker is descheduled, so benchmark precision needs independent A/A
 validation. No control reply or screenshot timestamp is substituted for it.
 
 Supported action labels are `import`, `preview`, `exposure`, `switch`, `export`.
-Import starts at confirmation and completes once import finishes and every visible
-virtualized grid cell has thumbnail pixels; offscreen coverage is verified by the
-client separately. A recorded `view.detail` preview also executes `view.zoom100`
+Tag confirmation for reviewed imports, or tag `ui.dropFiles` when the existing
+`importDroppedDirectly` setting is enabled. These are distinct input boundaries
+and need separate calibration. The profiling harness first resets to an empty
+catalog/grid, so older thumbnails cannot count as the response. Completion means
+import has finished and every visible virtualized grid cell has thumbnail pixels;
+offscreen coverage is verified by the client separately.
+A recorded `view.detail` preview also executes `view.zoom100`
 on the UI thread before drawing. Switch completion requires the active photo's
 full render, including a pending zoom region. Startup is recorded under the id
 `startup`, from desktop entry to the first photo frame (an empty startup records
