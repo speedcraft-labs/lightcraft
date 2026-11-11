@@ -66,9 +66,16 @@ pub(crate) fn install_process_exit_handler() {
 #[cfg(unix)]
 extern "C" fn shutdown_at_exit() {
     begin_shutdown();
+    let timeout = Duration::from_secs(120);
+    if crate::gpu_is_broken() {
+        // A retired device can fault if the exit hook polls it again. Wait for calls already in
+        // the driver, then leave device teardown to the process instead.
+        let _ = wait_idle(timeout);
+        return;
+    }
     // `GPU` and its device are process statics, not TLS. After all callers leave the driver,
     // finish submitted work too; otherwise the driver's process teardown can race its own queue.
-    let _ = crate::drain_idle(Duration::from_secs(120));
+    let _ = crate::drain_idle(timeout);
 }
 
 impl Gate {
