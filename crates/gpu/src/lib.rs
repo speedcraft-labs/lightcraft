@@ -77,6 +77,11 @@ fn mark_broken(reason: &str) {
     BROKEN.store(true, Ordering::Relaxed);
 }
 
+/// Whether a device failure retired GPU rendering for this process.
+pub(crate) fn gpu_is_broken() -> bool {
+    BROKEN.load(Ordering::Relaxed)
+}
+
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn record_fallback(reason: String) {
     *LAST_FALLBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
