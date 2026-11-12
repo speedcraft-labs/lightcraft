@@ -32,6 +32,7 @@ mod control_server;
 mod dialog_filter;
 mod editors;
 mod hdr_display;
+mod latency;
 mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
@@ -181,6 +182,10 @@ impl eframe::App for App {
             self.0.renderer.set_screen_textures(Box::new(t));
         }
         self.0.ui(ui);
+        // The disabled path does not inspect state, read a clock, poll a device or add a shape.
+        if self.0.latency.is_some() {
+            latency::frame(&mut self.0, ui, frame);
+        }
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // (a size the window was just given is remembered too)
@@ -223,6 +228,7 @@ impl eframe::App for App {
 const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> eframe::Result {
+    let latency_entry = (std::env::var("LIGHTCRAFT_LATENCY").as_deref() == Ok("1")).then(std::time::Instant::now);
     // Windows: the update helper is a copy of this program started with `--finish-update`.
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&lightcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
@@ -364,6 +370,9 @@ fn main() -> eframe::Result {
                 // HDR display: SDR unless the surface, platform and display all allow HDR
                 hdr_display::report(cc.wgpu_render_state.as_ref().map(|r| r.target_format));
                 let mut app = LightcraftApp::new(session, services(cc, app_log_file.as_deref()));
+                if let (Some(r), Some(entry)) = (app.latency.as_mut(), latency_entry) {
+                    r.startup(entry);
+                }
                 app.set_startup_update_check(true);
                 if let Some(ui) = prefs {
                     app.ui = ui;
@@ -413,7 +422,7 @@ fn main() -> eframe::Result {
                     app.notices.push(notice);
                 }
                 if let Some(port) = control_port {
-                    let rx = control_server::start(port, cc.egui_ctx.clone());
+                    let rx = control_server::start(port, cc.egui_ctx.clone(), app.latency.as_ref().map(|r| r.reader()));
                     app = app.with_control(rx);
                 }
                 if let Some(mut p) = problem {

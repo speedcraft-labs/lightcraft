@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
-use lightcraft_ui_egui::ControlRequest;
+use lightcraft_ui_egui::{ControlRequest, latency::Reader};
 use serde_json::{Value, json};
 
 /// Longest accepted request line (bytes, without the newline). Requests are small JSON objects;
@@ -23,7 +23,7 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
+pub fn start(port: u16, ctx: egui::Context, latency: Option<Reader>) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -33,14 +33,14 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     log::info!("control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx));
+    std::thread::spawn(move || accept_loop(listener, tx, ctx, latency));
     rx
 }
 
-fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
+fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, latency: Option<Reader>) {
     let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
-        let _ = spawn_connection(stream, tx.clone(), ctx.clone(), Arc::clone(&open), IDLE_TIMEOUT);
+        let _ = spawn_connection(stream, tx.clone(), ctx.clone(), Arc::clone(&open), IDLE_TIMEOUT, latency.clone());
     }
 }
 
@@ -51,6 +51,7 @@ fn spawn_connection(
     ctx: egui::Context,
     open: Arc<AtomicUsize>,
     idle_timeout: Duration,
+    latency: Option<Reader>,
 ) -> Option<std::thread::JoinHandle<()>> {
     if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
         open.fetch_sub(1, Ordering::SeqCst);
@@ -58,7 +59,7 @@ fn spawn_connection(
         return None;
     }
     Some(std::thread::spawn(move || {
-        serve(stream, &tx, &ctx, idle_timeout);
+        serve(stream, &tx, &ctx, idle_timeout, latency);
         open.fetch_sub(1, Ordering::SeqCst);
     }))
 }
@@ -82,12 +83,22 @@ pub const HIDDEN_WINDOW_ERROR: &str = "the app drew no frame for 5 s, so the req
 /// while a client is connected (a link in the browser, Show in Explorer, an external editor) kept a
 /// copy of the connection: closing it then reached the client only when that program exited, as a
 /// reset instead of a clean close.
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, idle_timeout: Duration) {
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, idle_timeout: Duration, latency: Option<Reader>) {
     if let Err(e) = stream.set_read_timeout(Some(idle_timeout)) {
         log::warn!("control connection closed: could not set idle read timeout: {e}");
         return;
     }
     serve_stream(stream, |method, params| {
+        if method == "ui.latency.wait"
+            && let Some(reader) = latency.as_ref()
+        {
+            let (reply, done) = channel();
+            if let Err(e) = reader.wait(&params, reply) {
+                return Some(json!({"ok":false,"error":e}));
+            }
+            // Do not route this read through the UI or its repainting reply-wait loop.
+            return Some(done.recv_timeout(Duration::from_secs(600)).unwrap_or_else(|_| json!({"ok":false,"error":"latency record timeout"})));
+        }
         let (req, rrx) = ControlRequest::new(method, params);
         let state = Arc::clone(&req.state);
         tx.send(req).ok()?;
@@ -290,6 +301,35 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(St
 mod tests {
     use super::*;
 
+    #[test]
+    fn latency_record_reads_do_not_dispatch_or_repaint_the_ui() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (tx, requests) = channel();
+        let ctx = egui::Context::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = wakes.clone();
+        ctx.set_request_repaint_callback(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let recorder = lightcraft_ui_egui::latency::Recorder::enabled();
+        let reader = recorder.reader();
+        let worker = std::thread::spawn(move || serve(stream, &tx, &ctx, IDLE_TIMEOUT, Some(reader)));
+        writeln!(client, "{{\"id\":1,\"method\":\"ui.latency.wait\",\"params\":{{\"id\":\"unknown\"}}}}").unwrap();
+        let mut line = String::new();
+        BufReader::new(&client).read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "unknown latency id");
+        assert!(requests.try_recv().is_err());
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        worker.join().unwrap();
+    }
+
     /// Own the client and worker together: even a failing timeout assertion closes the socket
     /// before joining, so the regression cannot leave a worker stuck in a read.
     struct Connection {
@@ -311,7 +351,7 @@ mod tests {
             stream.set_nodelay(true).unwrap();
             before(&mut client);
             let (tx, requests) = channel();
-            let worker = spawn_connection(stream, tx, egui::Context::default(), Arc::clone(open), idle).unwrap();
+            let worker = spawn_connection(stream, tx, egui::Context::default(), Arc::clone(open), idle, None).unwrap();
             Self { client: BufReader::new(client), requests, worker: Some(worker) }
         }
 
@@ -536,7 +576,7 @@ mod tests {
         let (tx, _rx) = channel::<ControlRequest>();
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            serve(s, &tx, &egui::Context::default(), IDLE_TIMEOUT);
+            serve(s, &tx, &egui::Context::default(), IDLE_TIMEOUT, None);
         });
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();

@@ -14,7 +14,35 @@ impl LightcraftApp {
                 continue;
             }
             let reply = req.reply.clone();
-            match control::handle(self, ctx, &req) {
+            if req.method == "ui.latency.wait" {
+                let result = self.latency.as_mut().ok_or("latency recorder disabled").and_then(|r| r.wait(&req.params, reply.clone()));
+                if let Err(e) = result {
+                    let _ = reply.send(control::failure(e));
+                }
+                continue;
+            }
+            if req.method == "ui.latency.idle" {
+                let _ =
+                    reply.send(control::success(serde_json::json!({"idle": self.latency_pending().is_empty(), "pending": self.latency_pending()})));
+                continue;
+            }
+            if let Some(meta) = req.params.get("_latency") {
+                let key = self.renderer.textures.get(&crate::render::Slot::Main).map(|t| t.key);
+                let result = self.latency.as_mut().ok_or("latency recorder disabled").and_then(|r| r.begin(meta, key));
+                if let Err(e) = result {
+                    let _ = reply.send(control::failure(e));
+                    continue;
+                }
+            }
+            let outcome = control::handle(self, ctx, &req);
+            if req.params.get("_latency").is_some_and(|m| m["action"] == "preview")
+                && req.params["command"] == "view.detail"
+                && let Err(e) = self.run("view.zoom100", serde_json::json!({}))
+            {
+                let _ = reply.send(control::failure(e));
+                continue;
+            }
+            match outcome {
                 control::Outcome::Done(v) => {
                     let _ = reply.send(v);
                 }

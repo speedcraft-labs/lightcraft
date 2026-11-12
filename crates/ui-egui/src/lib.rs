@@ -30,6 +30,7 @@ mod frame_rate;
 pub mod headless;
 pub mod i18n;
 pub mod icons;
+pub mod latency;
 pub mod lens_db;
 pub mod lightroom_import;
 pub mod links;
@@ -157,6 +158,8 @@ pub struct LightcraftApp {
     pub services: Services,
     pub renderer: render::Renderer,
     pub perf: Perf,
+    /// Off by default; the desktop host supplies GPU completion for recorded frames.
+    pub latency: Option<latency::Recorder>,
     /// macOS: the host draws the traffic lights over our top bar.
     pub integrated_titlebar: bool,
     /// The `movable` flag last given to the window (macOS, `craft_window::title_bar::sync_movable`).

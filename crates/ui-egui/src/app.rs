@@ -46,6 +46,7 @@ impl LightcraftApp {
             notice_input: Default::default(),
             quit_confirmed: false,
             control_rx: None,
+            latency: crate::latency::Recorder::from_env(),
             pending_screenshots: vec![],
             pending_gestures: vec![],
             layout_epoch: 0,

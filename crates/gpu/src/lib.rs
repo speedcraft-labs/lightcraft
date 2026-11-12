@@ -77,7 +77,8 @@ fn mark_broken(reason: &str) {
     BROKEN.store(true, Ordering::Relaxed);
 }
 
-/// Whether a device failure retired GPU rendering for this process.
+/// Whether a device failure retired GPU rendering for this process (the Unix atexit guard).
+#[cfg(unix)]
 pub(crate) fn gpu_is_broken() -> bool {
     BROKEN.load(Ordering::Relaxed)
 }

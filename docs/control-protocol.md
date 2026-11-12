@@ -419,3 +419,47 @@ A center `move` can include `before` (panel ID or null to append) for tab order.
 The equivalent `{"action": ...}` form accepts a serialized shared docking action;
 this is also the form emitted by the renderer. Protected-canvas and app-specific panel
 rules apply equally to both forms.
+
+### Opt-in action latency records
+
+Desktop profiling sessions may set `LIGHTCRAFT_LATENCY=1` before launch. Normal
+launches do not allocate a recorder or add frame callbacks, clocks or GPU polling.
+A recorded request has an extra top-level params member, for example:
+
+```json
+{"id":1,"method":"engine.execute","params":{"command":"library.select","params":{"ids":[2]},"_latency":{"id":"switch-1","action":"switch"}}}
+{"id":2,"method":"ui.latency.wait","params":{"id":"switch-1"}}
+```
+
+The second request receives one deferred response after completion. A shared
+recorder reader serves it on the socket thread, without UI dispatch or any
+repaint request. It does not block the UI thread. Records contain UI-thread acceptance, first reflecting frame
+and completion timestamps in monotonic nanoseconds relative to this process's
+recorder epoch, UI frame counts, and pending-work snapshots from those frames.
+The endpoint explicitly means **GPU work for that frame confirmed complete**,
+not monitor scanout. The desktop host attaches a completion callback to egui's
+own command encoder and polls independently of control traffic. Delivery can be
+late if that worker is descheduled, so benchmark precision needs independent A/A
+validation. No control reply or screenshot timestamp is substituted for it.
+
+Supported action labels are `import`, `preview`, `exposure`, `switch`, `export`.
+Tag confirmation for reviewed imports, or tag `ui.dropFiles` when the existing
+`importDroppedDirectly` setting is enabled. These are distinct input boundaries
+and need separate calibration. The profiling harness first resets to an empty
+catalog/grid, so older thumbnails cannot count as the response. Completion means
+import has finished and every visible virtualized grid cell has thumbnail pixels;
+offscreen coverage is verified by the client separately.
+A recorded `view.detail` preview also executes `view.zoom100`
+on the UI thread before drawing. Switch completion requires the active photo's
+full render, including a pending zoom region. Startup is recorded under the id
+`startup`, from desktop entry to the first photo frame (an empty startup records
+the empty interactive window). `ui.latency.idle` reports pending renderer, import,
+export, activity, task and synthetic-input work for an untimed admission gate.
+
+Only one incomplete action is allowed, ids are unique, and a process keeps at
+most 4,096 records and 16 waiting readers. Invalid/disabled/unknown records fail
+explicitly. Profiling waits have a 10-minute transport cap; a benchmark must set
+its own shorter acquisition deadline. `_latency.test_delay_ns` is an optional,
+explicit switch-only sensitivity probe (at most one second): it sleeps after the
+acceptance stamp and retains requested/observed delay, rather than adjusting a
+reported duration. Ordinary requests do not sleep.
