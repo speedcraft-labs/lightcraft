@@ -3866,6 +3866,8 @@ name = "lightcraft-gpu"
 version = "0.21.1"
 dependencies = [
  "bytemuck",
+ "image",
+ "lightcraft-codecs",
  "lightcraft-color",
  "lightcraft-denoise",
  "lightcraft-develop",
@@ -3875,6 +3877,7 @@ dependencies = [
  "lightcraft-raster",
  "lightcraft-raw",
  "lightcraft-scenes",
+ "lightcraft-sysmem",
  "lightcraft-testkit",
  "log",
  "pollster 1.0.1",
@@ -3973,6 +3976,7 @@ dependencies = [
 name = "lightcraft-raster"
 version = "0.21.1"
 dependencies = [
+ "image",
  "libc",
  "lightcraft-color",
  "lightcraft-geom",
@@ -4044,6 +4048,9 @@ dependencies = [
 [[package]]
 name = "lightcraft-sysmem"
 version = "0.21.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "lightcraft-testkit"
@@ -4075,7 +4082,6 @@ dependencies = [
  "lightcraft-slideshow",
  "lightcraft-testkit",
  "log",
- "pollster 1.0.1",
  "serde",
  "serde_json",
  "toml",
