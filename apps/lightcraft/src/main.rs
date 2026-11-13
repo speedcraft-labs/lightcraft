@@ -43,6 +43,8 @@ mod screen_profile;
 #[cfg(windows)]
 mod win_screen_profile;
 mod window_gpu;
+#[cfg(target_os = "macos")]
+mod window_raise;
 
 use dialog_filter::FileDialogExt as _;
 use lightcraft_engine::Session;
@@ -227,6 +229,20 @@ impl eframe::App for App {
 /// a second; anything slower gives way to quitting.
 const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Driven by an agent (`--control`): don't activate the app on launch, so the user's keyboard
+/// focus stays where it is (macOS; winit activates ignoring other apps by default).
+fn agent_event_loop(agent: bool) -> Option<eframe::EventLoopBuilderHook> {
+    #[cfg(target_os = "macos")]
+    if agent {
+        return Some(Box::new(|b| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            b.with_activate_ignoring_other_apps(false);
+        }));
+    }
+    let _ = agent;
+    None
+}
+
 fn main() -> eframe::Result {
     let latency_entry = (std::env::var("LIGHTCRAFT_LATENCY").as_deref() == Ok("1")).then(std::time::Instant::now);
     // Windows: the update helper is a copy of this program started with `--finish-update`.
@@ -325,6 +341,7 @@ fn main() -> eframe::Result {
     let came_up_app = came_up.clone();
     // how the window was when the app was last used (checked: the settings file is a file)
     let opens_as = prefs.as_ref().and_then(|ui| ui.window).and_then(lightcraft_ui_egui::window_place::WindowPlace::checked);
+    let agent = control_port.is_some();
     let options = eframe::NativeOptions {
         renderer,
         viewport: as_remembered(egui::ViewportBuilder::default().with_title("LightCraft"), opens_as)
@@ -336,8 +353,11 @@ fn main() -> eframe::Result {
             .with_title_shown(false)
             .with_icon(app_icon())
             // Wayland matches the window to packaging/linux/ai.storyteller.lightcraft.desktop by this id
-            .with_app_id(APP_ID),
+            .with_app_id(APP_ID)
+            // Started for an agent (`--control`): open without taking the user's keyboard focus.
+            .with_active(!agent),
         wgpu_options,
+        event_loop_builder: agent_event_loop(agent),
         ..Default::default()
     };
     // the app's copy: `log_file` is still named in the message of a start that fails
@@ -370,6 +390,10 @@ fn main() -> eframe::Result {
                 // HDR display: SDR unless the surface, platform and display all allow HDR
                 hdr_display::report(cc.wgpu_render_state.as_ref().map(|r| r.target_format));
                 let mut app = LightcraftApp::new(session, services(cc, app_log_file.as_deref()));
+                #[cfg(target_os = "macos")]
+                if agent {
+                    app.raise_without_focus = Some(window_raise::raise_without_focus);
+                }
                 if let (Some(r), Some(entry)) = (app.latency.as_mut(), latency_entry) {
                     r.startup(entry);
                 }
