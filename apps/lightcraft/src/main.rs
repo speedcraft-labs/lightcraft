@@ -360,6 +360,15 @@ fn main() -> eframe::Result {
         event_loop_builder: agent_event_loop(agent),
         ..Default::default()
     };
+    // Keep an agent window behind normal application windows, even when eframe first shows it.
+    #[cfg(target_os = "macos")]
+    let options = if agent {
+        let mut options = options;
+        options.viewport = options.viewport.with_window_level(egui::viewport::WindowLevel::AlwaysOnBottom);
+        options
+    } else {
+        options
+    };
     // the app's copy: `log_file` is still named in the message of a start that fails
     let app_log_file = log_file.clone();
     #[cfg(all(unix, not(target_os = "macos")))]
