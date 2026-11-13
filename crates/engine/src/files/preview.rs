@@ -140,15 +140,22 @@ pub fn fs_preview_loader() -> PreviewLoader {
         let gate = crate::memory::work_gate();
         let background = crate::memory::is_background();
         let thumbnail = max_edge <= crate::media::SourceLevel::Thumb.max_edge();
+        let full_charge = len.saturating_mul(2);
         // Keep the full-file reservation while locating the preview: sparse planning may use a
         // file-sized buffer before it returns its bounded JPEG window.
-        let mut permit = if background { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
+        let mut permit = if background { gate.acquire(full_charge) } else { gate.acquire_urgent(full_charge) };
+        let mut permit_shrunk = false;
         if let Some((header, window, read)) = preview_window(path, max_edge).ok().flatten() {
             // Thumbnail decodes only need the bounded JPEG working set; keep larger editor
             // previews charged at the full RAW size so they do not crowd out other render work.
+            // Keep the full charge when the estimate would grow it: waiting to grow while holding
+            // a permit could make several small-file previews wait on one another.
             if thumbnail {
                 let bytes = preview_work_bytes(header.len(), window.len(), max_edge);
-                permit.resize(bytes);
+                if bytes < full_charge {
+                    permit.resize(bytes);
+                    permit_shrunk = true;
+                }
             }
             if let Some(image) = quick_image_srgb(&header, &window, read.adobe_rgb, max_edge) {
                 return Some(image);
@@ -157,13 +164,11 @@ pub fn fs_preview_loader() -> PreviewLoader {
             // restore the whole-file charge for the fallback.
             drop(window);
             drop(header);
-            if thumbnail {
-                if background {
-                    permit.resize(len.saturating_mul(2));
-                } else {
-                    drop(permit);
-                    permit = gate.acquire_urgent(len.saturating_mul(2));
-                }
+            if permit_shrunk {
+                // The bounded buffers are gone. Release the small permit before reacquiring the
+                // whole-file charge so this worker cannot hold gate capacity while it waits.
+                drop(permit);
+                permit = if background { gate.acquire(full_charge) } else { gate.acquire_urgent(full_charge) };
             }
         }
         // Some formats have no bounded preview range, or the range is not a decodable image. The
