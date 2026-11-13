@@ -248,10 +248,7 @@ pub fn shutting_down() -> bool {
 pub fn wait_idle(timeout: std::time::Duration) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if !drain_idle(timeout) {
-            return false;
-        }
-        true
+        drain_idle(timeout)
     }
     #[cfg(target_arch = "wasm32")]
     {

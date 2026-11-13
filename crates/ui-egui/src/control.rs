@@ -13,6 +13,7 @@
 //! - `ui.key {key, shift?, alt?, cmd?}` / `ui.text {text}` / `ui.scroll {dx, dy, source?, unit?, phase?}`
 //! - `ui.set {view?, panel?, filmstrip?, leftPanel?, zoom?, …}` / `ui.dialog.confirm|cancel`
 //! - `ui.screenshot {path?, headless?}` (headless: CPU-rendered, no compositor needed), `ui.resize {width, height}`, `ui.render {id?, size?, path?}`, `app.quit`
+//! - `ui.focus`: explicitly activate the window and take keyboard focus.
 
 use std::sync::mpsc::Sender;
 
@@ -332,6 +333,13 @@ pub(crate) fn widget_target_visible(ctx: &egui::Context, hit: Option<crate::widg
 /// file drops and synthetic input, capture screenshots, or return an error for an unknown or
 /// invalid request. Requests that need fresh widget geometry are queued as `Outcome` values.
 pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    if req.method.starts_with("ui.") && req.method != "ui.focus" {
+        // UI requests need a rendered pass, but must not activate the app for an agent.
+        if let Some(raise_without_focus) = app.raise_without_focus {
+            raise_without_focus();
+        }
+        ctx.request_repaint();
+    }
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let f = |k: &str| p.get(k).and_then(Value::as_f64);
@@ -494,6 +502,11 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
             }
             _ => err("ui.zoomFactor: factor must be a number from 0.5 to 3"),
         },
+        "ui.focus" => {
+            // Explicit request: activate the app and take keyboard focus.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ok(Value::Null)
+        }
         "ui.screenshot" => {
             // Never over a photo's original, and pin the destination identity now: the write
             // revalidates it after the (possibly lengthy) capture and never replaces a path that

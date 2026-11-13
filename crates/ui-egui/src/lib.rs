@@ -156,6 +156,8 @@ pub struct LightcraftApp {
     pub session: Session,
     pub ui: UiState,
     pub services: Services,
+    /// Order the window forward for agent-driven UI requests without activating the app (macOS).
+    pub raise_without_focus: Option<fn() -> bool>,
     pub renderer: render::Renderer,
     pub perf: Perf,
     /// Off by default; the desktop host supplies GPU completion for recorded frames.
