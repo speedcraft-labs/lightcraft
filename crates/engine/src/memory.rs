@@ -151,12 +151,48 @@ impl WorkGate {
     }
 }
 
+impl Permit<'_> {
+    /// Change a held reservation without opening an unaccounted gap. Growing waits for space
+    /// held by other permits; this permit itself never makes the gate wait on itself.
+    pub fn resize(&mut self, bytes: usize) {
+        let mut g = self.gate.lock();
+        loop {
+            let other_bytes = g.0.saturating_sub(self.bytes as u128);
+            if bytes <= self.bytes || other_bytes == 0 || other_bytes.saturating_add(bytes as u128) <= g.1 as u128 {
+                g.0 = other_bytes.saturating_add(bytes as u128);
+                break;
+            }
+            g = self.gate.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        self.bytes = bytes;
+        drop(g);
+        self.gate.cv.notify_all();
+    }
+}
+
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let mut g = self.gate.lock();
         g.0 = g.0.saturating_sub(self.bytes as u128);
         drop(g);
         self.gate.cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkGate;
+
+    #[test]
+    fn permit_can_shrink_when_its_initial_charge_exceeds_the_gate() {
+        let gate = WorkGate::new(10);
+        let mut permit = gate.acquire(20);
+
+        permit.resize(3);
+
+        assert_eq!(gate.usage(), (3, 10));
+        permit.resize(20);
+        assert_eq!(gate.usage(), (20, 10));
     }
 }
 

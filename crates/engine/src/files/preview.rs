@@ -1,6 +1,22 @@
 use super::fs::{quick_image_srgb, raf_preview_extent, read_prefix, read_prefix_at};
 use super::{Arc, Filter, Orientation, PreviewLoader, Rgb32f, SourceInfo, fit};
 
+fn preview_work_bytes(header_len: usize, window_len: usize, max_edge: usize) -> usize {
+    window_len.saturating_mul(2).saturating_add(header_len).saturating_add(max_edge.saturating_mul(max_edge).saturating_mul(32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_work_bytes;
+
+    #[test]
+    fn bounded_preview_charge_tracks_the_window_not_the_raw_container() {
+        let charge = preview_work_bytes(1024, 4 << 20, 384);
+        assert_eq!(charge, (8 << 20) + 1024 + (384 * 384 * 32));
+        assert!(charge < 2 * (50 << 20), "bounded preview charge {charge} should be below the full-file charge");
+    }
+}
+
 /// Orientation for an embedded preview: its own EXIF orientation when it has one, else the raw file's.
 pub(super) fn preview_orientation(raw_bytes: &[u8], jpeg_orientation: u16) -> Orientation {
     if jpeg_orientation > 1 {
@@ -122,14 +138,33 @@ pub fn fs_preview_loader() -> PreviewLoader {
     Arc::new(|path: &str, max_edge: usize| {
         let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
         let gate = crate::memory::work_gate();
-        let _permit = if crate::memory::is_background() { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
-        if let Some(image) = preview_window(path, max_edge)
-            .ok()
-            .flatten()
-            .and_then(|(header, window, read)| quick_image_srgb(&header, &window, read.adobe_rgb, max_edge))
-        {
-            return Some(image);
+        let background = crate::memory::is_background();
+        // Keep the full-file reservation while locating the preview: sparse planning may use a
+        // file-sized buffer before it returns its bounded JPEG window.
+        let mut permit = if background { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
+        if let Some((header, window, read)) = preview_window(path, max_edge).ok().flatten() {
+            // After preview_window returns, its sparse-plan buffer is gone. The bounded decode
+            // holds the JPEG window and decoded/resampled pixels, not the whole RAW file, so
+            // replace the file-sized reservation with this smaller working-set charge in place.
+            let bytes = preview_work_bytes(header.len(), window.len(), max_edge);
+            permit.resize(bytes);
+            if let Some(image) = quick_image_srgb(&header, &window, read.adobe_rgb, max_edge) {
+                return Some(image);
+            }
+            // The bounded decode declined the range; discard its buffers before waiting to
+            // restore the whole-file charge for the fallback.
+            drop(window);
+            drop(header);
+            if background {
+                permit.resize(len.saturating_mul(2));
+            } else {
+                drop(permit);
+                permit = gate.acquire_urgent(len.saturating_mul(2));
+            }
         }
+        // Some formats have no bounded preview range, or the range is not a decodable image. The
+        // fallback reads and decodes the whole file, so retain the conservative full-file charge.
+        let _permit = permit;
         embedded_preview_srgb(&std::fs::read(path).ok()?, max_edge)
     })
 }
