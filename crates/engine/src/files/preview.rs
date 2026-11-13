@@ -139,15 +139,17 @@ pub fn fs_preview_loader() -> PreviewLoader {
         let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
         let gate = crate::memory::work_gate();
         let background = crate::memory::is_background();
+        let thumbnail = max_edge <= crate::media::SourceLevel::Thumb.max_edge();
         // Keep the full-file reservation while locating the preview: sparse planning may use a
         // file-sized buffer before it returns its bounded JPEG window.
         let mut permit = if background { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
         if let Some((header, window, read)) = preview_window(path, max_edge).ok().flatten() {
-            // After preview_window returns, its sparse-plan buffer is gone. The bounded decode
-            // holds the JPEG window and decoded/resampled pixels, not the whole RAW file, so
-            // replace the file-sized reservation with this smaller working-set charge in place.
-            let bytes = preview_work_bytes(header.len(), window.len(), max_edge);
-            permit.resize(bytes);
+            // Thumbnail decodes only need the bounded JPEG working set; keep larger editor
+            // previews charged at the full RAW size so they do not crowd out other render work.
+            if thumbnail {
+                let bytes = preview_work_bytes(header.len(), window.len(), max_edge);
+                permit.resize(bytes);
+            }
             if let Some(image) = quick_image_srgb(&header, &window, read.adobe_rgb, max_edge) {
                 return Some(image);
             }
@@ -155,11 +157,13 @@ pub fn fs_preview_loader() -> PreviewLoader {
             // restore the whole-file charge for the fallback.
             drop(window);
             drop(header);
-            if background {
-                permit.resize(len.saturating_mul(2));
-            } else {
-                drop(permit);
-                permit = gate.acquire_urgent(len.saturating_mul(2));
+            if thumbnail {
+                if background {
+                    permit.resize(len.saturating_mul(2));
+                } else {
+                    drop(permit);
+                    permit = gate.acquire_urgent(len.saturating_mul(2));
+                }
             }
         }
         // Some formats have no bounded preview range, or the range is not a decodable image. The
