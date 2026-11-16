@@ -59,6 +59,7 @@ pub use wgpu;
 pub(crate) static DEVICE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+#[cfg(unix)]
 /// Set when the host drained the device after closing the process-wide gate.
 static SHUTDOWN_DRAINED: AtomicBool = AtomicBool::new(false);
 /// Set when a GPU render failed: the process stays on the CPU from then on.
