@@ -66,16 +66,11 @@ pub(crate) fn install_process_exit_handler() {
 #[cfg(unix)]
 extern "C" fn shutdown_at_exit() {
     begin_shutdown();
-    let timeout = Duration::from_secs(120);
-    if crate::gpu_is_broken() {
-        // A retired device can fault if the exit hook polls it again. Wait for calls already in
-        // the driver, then leave device teardown to the process instead.
-        let _ = wait_idle(timeout);
-        return;
-    }
-    // `GPU` and its device are process statics, not TLS. After all callers leave the driver,
-    // finish submitted work too; otherwise the driver's process teardown can race its own queue.
-    let _ = crate::drain_idle(timeout);
+    // Rust has already destroyed the main thread's TLS before libc invokes atexit handlers.
+    // wgpu::Device::poll can consult that TLS and panic here. Hosts that can shut down cleanly
+    // drain submitted work with wait_idle before returning; this last-resort hook only prevents
+    // process teardown from racing a call that is still inside the driver.
+    let _ = wait_idle(Duration::from_secs(120));
 }
 
 impl Gate {
