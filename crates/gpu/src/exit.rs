@@ -76,7 +76,7 @@ extern "C" fn shutdown_at_exit() {
     // libc runs atexit handlers after the main thread's TLS has been destroyed, and wgpu::Device::poll
     // can consult that TLS. Drain on a fresh Rust thread so device teardown still waits for queued
     // work without polling from the exiting thread.
-    let worker = std::thread::Builder::new().name("lightcraft-gpu-exit".into()).spawn(|| crate::drain_idle(timeout));
+    let worker = std::thread::Builder::new().name("lightcraft-gpu-exit".into()).spawn(move || crate::drain_idle(timeout));
     match worker {
         Ok(worker) => {
             if worker.join().is_err() {
