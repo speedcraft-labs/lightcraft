@@ -59,6 +59,9 @@ pub use wgpu;
 pub(crate) static DEVICE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+#[cfg(unix)]
+/// Set when the host drained the device after closing the process-wide gate.
+static SHUTDOWN_DRAINED: AtomicBool = AtomicBool::new(false);
 /// Set when a GPU render failed: the process stays on the CPU from then on.
 static BROKEN: AtomicBool = AtomicBool::new(false);
 
@@ -81,6 +84,12 @@ fn mark_broken(reason: &str) {
 #[cfg(unix)]
 pub(crate) fn gpu_is_broken() -> bool {
     BROKEN.load(Ordering::Relaxed)
+}
+
+/// Whether a host already drained submitted GPU work after starting shutdown.
+#[cfg(unix)]
+pub(crate) fn shutdown_drained() -> bool {
+    SHUTDOWN_DRAINED.load(Ordering::Acquire)
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -248,7 +257,12 @@ pub fn shutting_down() -> bool {
 pub fn wait_idle(timeout: std::time::Duration) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        drain_idle(timeout)
+        let idle = drain_idle(timeout);
+        #[cfg(unix)]
+        if idle && shutting_down() {
+            SHUTDOWN_DRAINED.store(true, Ordering::Release);
+        }
+        idle
     }
     #[cfg(target_arch = "wasm32")]
     {

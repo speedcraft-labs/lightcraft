@@ -67,15 +67,27 @@ pub(crate) fn install_process_exit_handler() {
 extern "C" fn shutdown_at_exit() {
     begin_shutdown();
     let timeout = Duration::from_secs(120);
-    if crate::gpu_is_broken() {
-        // A retired device can fault if the exit hook polls it again. Wait for calls already in
-        // the driver, then leave device teardown to the process instead.
+    if crate::gpu_is_broken() || crate::shutdown_drained() {
+        // A retired device can fault if the exit hook polls it again. A host may also already
+        // have drained the device after closing the gate. In both cases, just wait for any call
+        // still inside the driver.
         let _ = wait_idle(timeout);
         return;
     }
-    // `GPU` and its device are process statics, not TLS. After all callers leave the driver,
-    // finish submitted work too; otherwise the driver's process teardown can race its own queue.
-    let _ = crate::drain_idle(timeout);
+    // libc runs atexit handlers after the main thread's TLS has been destroyed, and wgpu::Device::poll
+    // can consult that TLS. Drain on a fresh Rust thread so device teardown still waits for queued
+    // work without polling from the exiting thread.
+    let worker = std::thread::Builder::new().name("lightcraft-gpu-exit".into()).spawn(move || crate::drain_idle(timeout));
+    match worker {
+        Ok(worker) => {
+            if worker.join().is_err() {
+                let _ = wait_idle(timeout);
+            }
+        }
+        Err(_) => {
+            let _ = wait_idle(timeout);
+        }
+    }
 }
 
 impl Gate {
