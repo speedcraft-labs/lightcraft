@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   git-sources:
+<<<<<<< HEAD
     name: Git dependencies come from approved repositories
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -64,6 +65,10 @@ jobs:
               print("Git dependencies outside approved repositories:", *bad, sep="\n")
               sys.exit(1)
           PY
+=======
+    # Tracks @main so suite-wide CI fixes reach every app without a PR in each repository.
+    uses: storytold/craft-common-actions/.github/workflows/git-sources.yml@main
+>>>>>>> a4676b12497d8a8213fae0dca715c29fef7c3149
 
   nix:
     # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
