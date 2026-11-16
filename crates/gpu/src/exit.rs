@@ -67,9 +67,10 @@ pub(crate) fn install_process_exit_handler() {
 extern "C" fn shutdown_at_exit() {
     begin_shutdown();
     let timeout = Duration::from_secs(120);
-    if crate::gpu_is_broken() {
-        // A retired device can fault if the exit hook polls it again. Wait for calls already in
-        // the driver, then leave device teardown to the process instead.
+    if crate::gpu_is_broken() || crate::shutdown_drained() {
+        // A retired device can fault if the exit hook polls it again. A host may also already
+        // have drained the device after closing the gate. In both cases, just wait for any call
+        // still inside the driver.
         let _ = wait_idle(timeout);
         return;
     }
